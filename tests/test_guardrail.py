@@ -2,11 +2,17 @@
 Guardrail tests for the LangGraph adapter.
 
 Scenarios covered:
-  1. Clean pass        — output is fine, evaluate_guardrail called once, graph completes
-  2. Breach → reject   — human rejects, result.status = "guardrail_breached"
-  3. Breach → approve  — human approves, result.status = "completed"
-                         evaluate_guardrail called EXACTLY ONCE (the double-execution fix)
-  4. Keyword fallback  — without an API key the keyword scan catches obvious violations
+  1. Clean pass        — output is fine, evaluate_guardrail called once, graph completes;
+                         no guardrail doc written; checkpoints cleaned up after run
+  2. Breach → reject   — human rejects, result.status = "hitl_rejected";
+                         guardrail doc written with status="rejected"
+  3. Breach → approve  — human approves, result.status = "completed";
+                         evaluate_guardrail called EXACTLY ONCE (double-execution fix);
+                         guardrail doc written with status="approved"
+  4. Downstream nodes  — nodes after an approved breach still execute
+  5. Keyword fallback  — without an API key the keyword scan catches obvious violations
+  6. Two sequential    — two guarded nodes, both breach, both approved; each evaluated
+                         once; two guardrail docs written, both status="approved"
 
 All tests use a real MongoDB (localhost:27017) with an isolated "unistack_test" database
 that is wiped before and after each test. The SDK's poll interval is set to 0.1s so tests
@@ -45,7 +51,7 @@ def clean_db():
 
 
 def _wipe(db):
-    for col in ["spans", "hitl_queue", "checkpoints", "checkpoint_writes"]:
+    for col in ["spans", "hitl_queue", "checkpoints", "checkpoint_writes", "guardrails"]:
         db[col].drop()
 
 
@@ -97,10 +103,11 @@ def _resolve(db, activity_id: str, decision: str, after: float = 0.15):
 
 # ── Test 1: clean pass ────────────────────────────────────────────────────────
 
-def test_guardrail_clean_pass():
+def test_guardrail_clean_pass(clean_db):
     """
     When the output is clean, evaluate_guardrail is called once and the graph
-    completes without any interrupt.
+    completes without any interrupt. No guardrail doc is written. Checkpoints
+    are cleaned up after the run.
     """
     sdk = _sdk("grd-clean")
 
@@ -117,6 +124,10 @@ def test_guardrail_clean_pass():
 
     assert result.status == "completed"
     mock_eval.assert_called_once()
+    # No breach → no guardrail doc
+    assert clean_db.guardrails.count_documents({}) == 0
+    # Checkpoints cleaned up after run completes
+    assert clean_db.checkpoints.count_documents({}) == 0
 
 
 # ── Test 2: breach → human reject ─────────────────────────────────────────────
@@ -146,6 +157,12 @@ def test_guardrail_breach_reject(clean_db):
     # is "hitl_rejected" (same as a rejected regular HITL), not "guardrail_breached".
     assert result.status == "hitl_rejected"
     mock_eval.assert_called_once()
+    # Guardrail doc written and resolved as rejected
+    grd = clean_db.guardrails.find_one({"activity_id": activity_id})
+    assert grd is not None, "Guardrail breach was not written to unistack.guardrails"
+    assert grd["node"] == "guarded"
+    assert grd["status"] == "rejected"
+    assert grd["resolved_at"] is not None
 
 
 # ── Test 3: breach → human approve (the double-evaluation fix) ────────────────
@@ -182,6 +199,12 @@ def test_guardrail_breach_approve_no_double_eval(clean_db):
         f"evaluate_guardrail was called {mock_eval.call_count} times — "
         f"expected 1. The double-evaluation fix is broken."
     )
+    # Guardrail doc written and resolved as approved
+    grd = clean_db.guardrails.find_one({"activity_id": activity_id})
+    assert grd is not None, "Guardrail breach was not written to unistack.guardrails"
+    assert grd["node"] == "guarded"
+    assert grd["status"] == "approved"
+    assert grd["resolved_by"] == "test-runner"
 
 
 # ── Test 4: breach → approve → following nodes still run ──────────────────────
@@ -325,3 +348,10 @@ def test_two_sequential_guardrail_breaches_both_approved(clean_db):
         f"evaluate_guardrail called {len(call_log)} times — expected exactly 2 "
         f"(once per node, not twice per node). calls: {call_log}"
     )
+    # Both nodes should have guardrail docs, both approved
+    db = MongoClient(MONGO_URI)[TEST_DB]
+    grds = list(db.guardrails.find({"activity_id": activity_id_a}))
+    assert len(grds) == 2, f"Expected 2 guardrail docs, got {len(grds)}"
+    nodes = {g["node"] for g in grds}
+    assert nodes == {"node_a", "node_b"}
+    assert all(g["status"] == "approved" for g in grds)

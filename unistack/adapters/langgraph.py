@@ -137,10 +137,19 @@ class UniStack(UniStackCore):
                     return result
                 evaluation = evaluate_guardrail(policy, str(result), self._guardrail_context)
                 if not evaluation["passed"]:
+                    activity_id = _current_activity.get()
+                    self._write_guardrail_entry(
+                        activity_id,
+                        node=fn.__name__,
+                        policy=policy,
+                        reason=evaluation["reason"],
+                        status="pending",
+                    )
                     decision = interrupt({
                         "type": "guardrail_breach",
                         "policy": policy,
                         "reason": evaluation["reason"],
+                        "node": fn.__name__,
                     })
                     _REJECT = ("n", "no", "reject", "false")
                     if decision is False or str(decision).lower().strip() in _REJECT:
@@ -210,9 +219,20 @@ class UniStack(UniStackCore):
                     isinstance(intr_value, dict)
                     and intr_value.get("type") == "guardrail_breach"
                 )
+                breached_node = intr_value.get("node") if is_guardrail_breach else None
 
                 self._write_hitl_queue(activity_id, interrupts)
                 decision = self._poll_for_decision(activity_id)
+
+                # Resolve the guardrail audit record with the human's decision.
+                if is_guardrail_breach and breached_node:
+                    hitl_doc = self._db.hitl_queue.find_one({"activity_id": activity_id})
+                    self._resolve_guardrail_entry(
+                        activity_id,
+                        node=breached_node,
+                        status="approved" if decision != "rejected" else "rejected",
+                        resolved_by=hitl_doc.get("resolved_by") if hitl_doc else None,
+                    )
 
                 if decision == "rejected":
                     root_span.set_attribute("unistack.status", "hitl_rejected")
@@ -236,8 +256,7 @@ class UniStack(UniStackCore):
             _current_activity.reset(act_token)
             _current_workflow.reset(wf_token)
             self._provider.force_flush()
-            self._db.checkpoints.delete_many({"thread_id": activity_id})
-            self._db.checkpoint_writes.delete_many({"thread_id": activity_id})
+            self.checkpointer.delete_thread(activity_id)
 
         return RunResult(activity_id=activity_id, state=final_state, status=result_status)
 

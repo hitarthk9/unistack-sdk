@@ -109,6 +109,13 @@ class UniStack(UniStackCore):
                 result = fn(state)
                 evaluation = evaluate_guardrail(policy, str(result), self._guardrail_context)
                 if not evaluation["passed"]:
+                    self._write_guardrail_entry(
+                        _current_activity.get(),
+                        node=fn.__name__,
+                        policy=policy,
+                        reason=evaluation["reason"],
+                        status="halted",
+                    )
                     raise GuardrailBreached(policy, evaluation["reason"])
                 return result
             return wrapper

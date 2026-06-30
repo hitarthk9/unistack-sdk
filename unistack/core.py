@@ -94,6 +94,51 @@ class UniStackCore:
             return data.get("guardrail_context")
         return None
 
+    def _write_guardrail_entry(
+        self,
+        activity_id: str,
+        *,
+        node: str,
+        policy: str,
+        reason: str,
+        status: str = "pending",
+    ) -> None:
+        """Write a guardrail breach event to unistack.guardrails."""
+        self._db.guardrails.replace_one(
+            {"_id": f"{activity_id}::{node}"},
+            {
+                "_id": f"{activity_id}::{node}",
+                "activity_id": activity_id,
+                "workflow": self._workflow,
+                "node": node,
+                "policy": policy,
+                "reason": reason,
+                "status": status,
+                "detected_at": datetime.now(tz=timezone.utc),
+                "resolved_at": None,
+                "resolved_by": None,
+            },
+            upsert=True,
+        )
+
+    def _resolve_guardrail_entry(
+        self,
+        activity_id: str,
+        *,
+        node: str,
+        status: str,
+        resolved_by: str | None,
+    ) -> None:
+        """Update a guardrail breach record with the human decision."""
+        self._db.guardrails.update_one(
+            {"_id": f"{activity_id}::{node}"},
+            {"$set": {
+                "status": status,
+                "resolved_at": datetime.now(tz=timezone.utc),
+                "resolved_by": resolved_by,
+            }},
+        )
+
     def _write_hitl_entry(
         self,
         activity_id: str,
