@@ -23,6 +23,7 @@ from unistack.core import (
     _current_activity,
     _current_workflow,
     _resume_pending,
+    _guardrail_approved,
 )
 from unistack._guardrail import GuardrailBreached, evaluate_guardrail
 
@@ -130,6 +131,10 @@ class UniStack(UniStackCore):
             def wrapper(state):
                 from langgraph.types import interrupt
                 result = fn(state)
+                # On a guardrail-approved resume, run() sets this flag so we skip
+                # re-evaluating the same output that a human already reviewed and approved.
+                if _guardrail_approved.pop(_current_activity.get(), False):
+                    return result
                 evaluation = evaluate_guardrail(policy, str(result), self._guardrail_context)
                 if not evaluation["passed"]:
                     decision = interrupt({
@@ -200,6 +205,12 @@ class UniStack(UniStackCore):
                     root_span.set_status(Status(StatusCode.OK))
                     break
 
+                intr_value = interrupts[0].value if hasattr(interrupts[0], "value") else {}
+                is_guardrail_breach = (
+                    isinstance(intr_value, dict)
+                    and intr_value.get("type") == "guardrail_breach"
+                )
+
                 self._write_hitl_queue(activity_id, interrupts)
                 decision = self._poll_for_decision(activity_id)
 
@@ -208,6 +219,9 @@ class UniStack(UniStackCore):
                     root_span.set_status(Status(StatusCode.OK))
                     result_status = "hitl_rejected"
                     break
+
+                if is_guardrail_breach:
+                    _guardrail_approved[activity_id] = True
 
                 is_resume = True
                 input_val = Command(resume=True)

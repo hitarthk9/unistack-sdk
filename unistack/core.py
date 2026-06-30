@@ -12,9 +12,12 @@ from unistack._exporter import MongoDBSpanExporter
 
 _current_activity: ContextVar[str] = ContextVar("unistack_activity", default="unknown")
 _current_workflow: ContextVar[str] = ContextVar("unistack_workflow", default="unknown")
-# Module-level dict (not ContextVar) so mutations in one node are visible to the next
-# within the same process. Used to signal that the next node runs in a HITL resume pass.
+# Module-level dicts (not ContextVars) so mutations in one node are visible to the next
+# within the same process.
 _resume_pending: dict[str, bool] = {}
+# Set by run() when a guardrail-breach interrupt is approved. Consumed by the guardrail
+# wrapper on the resume pass to skip re-evaluating the same output a second time.
+_guardrail_approved: dict[str, bool] = {}
 
 
 class RunResult:
