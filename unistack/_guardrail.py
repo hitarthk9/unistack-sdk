@@ -1,6 +1,8 @@
 import json
 import os
 
+from unistack.config import GUARDRAIL_MODEL
+
 
 class GuardrailBreached(Exception):
     def __init__(self, policy: str, reason: str):
@@ -23,7 +25,7 @@ def evaluate_guardrail(policy: str, output: str, context: str | None = None) -> 
         client = anthropic.Anthropic(api_key=api_key)
         context_section = f"\nBusiness Context:\n{context}\n" if context else ""
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=GUARDRAIL_MODEL,
             max_tokens=150,
             messages=[{
                 "role": "user",

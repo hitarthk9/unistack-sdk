@@ -255,6 +255,7 @@ class UniStack(UniStackCore):
             context.detach(root_ctx)
             _current_activity.reset(act_token)
             _current_workflow.reset(wf_token)
+            _guardrail_approved.pop(activity_id, None)
             self._provider.force_flush()
             self.checkpointer.delete_thread(activity_id)
 

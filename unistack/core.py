@@ -2,10 +2,9 @@ import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 
-from opentelemetry import context, trace
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.trace import Status, StatusCode, set_span_in_context
 from pymongo import MongoClient
 
 from unistack._exporter import MongoDBSpanExporter
@@ -40,13 +39,8 @@ def _instrument_anthropic() -> None:
     except ImportError:
         return  # anthropic not installed — cost tracking simply won't run
 
+    from unistack.config import LLM_PRICES, DEFAULT_INPUT_PRICE, DEFAULT_OUTPUT_PRICE
     _original = _amsg.Messages.create
-    _PRICES: dict[str, tuple[float, float]] = {
-        "claude-haiku-4-5-20251001": (0.0000008, 0.000004),   # $0.80/$4.00 per MTok
-        "claude-haiku-4-5":          (0.0000008, 0.000004),
-        "claude-sonnet-4-6":         (0.000003,  0.000015),
-        "claude-opus-4-8":           (0.000015,  0.000075),
-    }
 
     def _capturing_create(self_client, *args, **kwargs):
         resp = _original(self_client, *args, **kwargs)
@@ -54,7 +48,7 @@ def _instrument_anthropic() -> None:
             span = trace.get_current_span()
             if span is not None and hasattr(resp, "usage") and resp.usage:
                 model = kwargs.get("model", "")
-                inp, out = _PRICES.get(model, (0.000001, 0.000005))
+                inp, out = LLM_PRICES.get(model, (DEFAULT_INPUT_PRICE, DEFAULT_OUTPUT_PRICE))
                 cost = resp.usage.input_tokens * inp + resp.usage.output_tokens * out
                 span.set_attribute("llm.model",         model)
                 span.set_attribute("llm.input_tokens",  resp.usage.input_tokens)
