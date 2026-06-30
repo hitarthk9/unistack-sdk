@@ -19,6 +19,55 @@ _resume_pending: dict[str, bool] = {}
 # wrapper on the resume pass to skip re-evaluating the same output a second time.
 _guardrail_approved: dict[str, bool] = {}
 
+# Sentinel: prevents patching the Anthropic client more than once per process.
+_ANTHROPIC_PATCHED = False
+
+
+def _instrument_anthropic() -> None:
+    """
+    Monkey-patch anthropic.resources.messages.Messages.create to auto-capture
+    token usage (input_tokens, output_tokens, cost_usd, model) on the active
+    OTel span, if one exists.
+
+    This is idempotent — safe to call on every UniStack.init().
+    If the anthropic package is not installed, this is a no-op.
+    """
+    global _ANTHROPIC_PATCHED
+    if _ANTHROPIC_PATCHED:
+        return
+    try:
+        import anthropic.resources.messages as _amsg
+    except ImportError:
+        return  # anthropic not installed — cost tracking simply won't run
+
+    _original = _amsg.Messages.create
+    _PRICES: dict[str, tuple[float, float]] = {
+        "claude-haiku-4-5-20251001": (0.0000008, 0.000004),   # $0.80/$4.00 per MTok
+        "claude-haiku-4-5":          (0.0000008, 0.000004),
+        "claude-sonnet-4-6":         (0.000003,  0.000015),
+        "claude-opus-4-8":           (0.000015,  0.000075),
+    }
+
+    def _capturing_create(self_client, *args, **kwargs):
+        resp = _original(self_client, *args, **kwargs)
+        try:
+            span = trace.get_current_span()
+            if span is not None and hasattr(resp, "usage") and resp.usage:
+                model = kwargs.get("model", "")
+                inp, out = _PRICES.get(model, (0.000001, 0.000005))
+                cost = resp.usage.input_tokens * inp + resp.usage.output_tokens * out
+                span.set_attribute("llm.model",         model)
+                span.set_attribute("llm.input_tokens",  resp.usage.input_tokens)
+                span.set_attribute("llm.output_tokens", resp.usage.output_tokens)
+                span.set_attribute("llm.cost_usd",      round(cost, 6))
+        except Exception:
+            pass  # never let instrumentation crash a user's LLM call
+        return resp
+
+    _capturing_create.__name__ = _original.__name__
+    _amsg.Messages.create = _capturing_create
+    _ANTHROPIC_PATCHED = True
+
 
 class RunResult:
     def __init__(self, activity_id: str, state: dict, status: str = "completed"):
@@ -52,6 +101,7 @@ class UniStackCore:
         self._provider = self._setup_otel()
         self._tracer = trace.get_tracer("unistack")
         self._guardrail_context = self._resolve_context(context, context_file)
+        _instrument_anthropic()
 
     @classmethod
     def init(
