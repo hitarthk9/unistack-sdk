@@ -9,24 +9,28 @@ class GuardrailBreached(Exception):
         super().__init__(f"Guardrail breached: {reason}")
 
 
-def evaluate_guardrail(policy: str, output: str) -> dict:
+def evaluate_guardrail(policy: str, output: str, context: str | None = None) -> dict:
     """
     Returns {"passed": bool, "reason": str}.
     Uses Claude Haiku if ANTHROPIC_API_KEY is set; falls back to keyword scan.
+    When context is provided, it is injected into the LLM prompt so the
+    evaluator has workflow-specific business domain knowledge.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
         import re
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
+        context_section = f"\nBusiness Context:\n{context}\n" if context else ""
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=150,
             messages=[{
                 "role": "user",
                 "content": (
-                    "You are a business policy guardrail evaluator.\n"
-                    f"Policy: {policy}\n"
+                    "You are a business policy guardrail evaluator."
+                    f"{context_section}\n"
+                    f"Policy to enforce: {policy}\n"
                     f"Output to evaluate: {output}\n\n"
                     'Respond with ONLY valid JSON, no markdown: '
                     '{"passed": true, "reason": "..."} or {"passed": false, "reason": "..."}'
