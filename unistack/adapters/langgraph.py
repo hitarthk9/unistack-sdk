@@ -10,10 +10,11 @@ Import path (backwards-compatible):
 """
 import functools
 
-from opentelemetry import context, trace
+from opentelemetry import context
 from opentelemetry.trace import Status, StatusCode, set_span_in_context
 
 from langgraph.checkpoint.mongodb import MongoDBSaver
+from langgraph.config import get_config as _lg_get_config
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
@@ -74,9 +75,24 @@ class UniStack(UniStackCore):
         Sets unistack.human_overridden=True on the span that ran after a human resume.
         """
         @functools.wraps(fn)
-        def wrapper(state, config=None):
+        def wrapper(state):
             activity_id = _current_activity.get()
-            workflow = _current_workflow.get()
+            workflow    = _current_workflow.get()
+
+            # When invoked outside sdk.run() (e.g. tests, alternative runners),
+            # _current_activity holds its default "unknown" value. Derive a better
+            # activity_id from LangGraph's own config context variable.
+            _act_token = _wf_token = None
+            if activity_id == "unknown":
+                try:
+                    cfg = _lg_get_config()
+                    activity_id = (cfg.get("configurable") or {}).get("thread_id") or "untracked-run"
+                except Exception:
+                    activity_id = "untracked-run"
+                _act_token = _current_activity.set(activity_id)
+            if workflow == "unknown":
+                workflow = self._workflow
+                _wf_token = _current_workflow.set(workflow)
 
             span = self._tracer.start_span(fn.__name__)
             span.set_attribute("unistack.activity_id", activity_id)
@@ -111,6 +127,8 @@ class UniStack(UniStackCore):
             finally:
                 span.end()
                 context.detach(ctx_token)
+                if _act_token: _current_activity.reset(_act_token)
+                if _wf_token:  _current_workflow.reset(_wf_token)
         return wrapper
 
     # ── @sdk.guardrail(policy) ───────────────────────────────────────────────
@@ -145,6 +163,17 @@ class UniStack(UniStackCore):
                         reason=evaluation["reason"],
                         status="pending",
                     )
+                    # Write the hitl_queue entry here — at the interrupt site — so the
+                    # record exists before sdk.run() starts polling, and so any caller
+                    # that bypasses sdk.run() also gets the queue entry.
+                    self._write_hitl_entry(
+                        activity_id,
+                        type_="guardrail_breach",
+                        message=f"Guardrail breach: {evaluation['reason']}",
+                        data={},
+                        policy=policy,
+                        reason=evaluation["reason"],
+                    )
                     decision = interrupt({
                         "type": "guardrail_breach",
                         "policy": policy,
@@ -161,8 +190,21 @@ class UniStack(UniStackCore):
     # ── sdk.hitl() ───────────────────────────────────────────────────────────
 
     def hitl(self, message: str, data: dict = None):
-        """Trigger a HITL pause inside a node. Wraps LangGraph's interrupt()."""
+        """
+        Trigger a HITL pause inside a node.
+
+        Writes the hitl_queue entry immediately (before the interrupt is raised)
+        so the record is visible to pollers as soon as the pause begins.
+        """
         from langgraph.types import interrupt
+        activity_id = _current_activity.get()
+        if activity_id and activity_id != "unknown":
+            self._write_hitl_entry(
+                activity_id,
+                type_="hitl",
+                message=message,
+                data=data or {},
+            )
         return interrupt({"message": message, "data": data or {}})
 
     # ── sdk.run() ────────────────────────────────────────────────────────────
@@ -221,7 +263,8 @@ class UniStack(UniStackCore):
                 )
                 breached_node = intr_value.get("node") if is_guardrail_breach else None
 
-                self._write_hitl_queue(activity_id, interrupts)
+                # hitl_queue entry was already written at the interrupt site
+                # (in sdk.hitl() or @sdk.guardrail). Just poll for the decision.
                 decision = self._poll_for_decision(activity_id)
 
                 # Resolve the guardrail audit record with the human's decision.
@@ -269,25 +312,6 @@ class UniStack(UniStackCore):
             if "__interrupt__" in event:
                 return list(event["__interrupt__"])
         return []
-
-    def _write_hitl_queue(self, activity_id: str, interrupts: list) -> None:
-        """Parse LangGraph interrupt objects and write to hitl_queue via core."""
-        intr = interrupts[0]
-        value = intr.value if hasattr(intr, "value") else {}
-        is_guardrail = isinstance(value, dict) and value.get("type") == "guardrail_breach"
-        if is_guardrail:
-            self._write_hitl_entry(
-                activity_id,
-                type_="guardrail_breach",
-                message=f"Guardrail breach: {value.get('reason', '')}",
-                data={},
-                policy=value.get("policy"),
-                reason=value.get("reason"),
-            )
-        else:
-            msg = value.get("message", "") if isinstance(value, dict) else str(value)
-            data = value.get("data", {}) if isinstance(value, dict) else {}
-            self._write_hitl_entry(activity_id, type_="hitl", message=msg, data=data)
 
 
 __all__ = ["UniStack"]

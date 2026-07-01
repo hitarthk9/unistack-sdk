@@ -93,7 +93,8 @@ Database: `unistack` (configurable via `db_name` param)
 | Collection | Written by | Purpose |
 |---|---|---|
 | `unistack.spans` | `_exporter.py` | One doc per node execution — raw OTel span |
-| `unistack.hitl_queue` | `sdk.run()` / `sdk.hitl()` | One doc per HITL/guardrail pause |
+| `unistack.hitl_queue` | `sdk.hitl()` / `@sdk.guardrail` | One doc per HITL/guardrail pause — written at interrupt site |
+| `unistack.guardrails` | `@sdk.guardrail` | One doc per guardrail evaluation (pending → approved/rejected) |
 | `unistack.checkpoints` | LangGraph MongoDBSaver | Transient — auto-deleted after activity |
 | `unistack.checkpoint_writes` | LangGraph MongoDBSaver | Transient — auto-deleted after activity |
 
