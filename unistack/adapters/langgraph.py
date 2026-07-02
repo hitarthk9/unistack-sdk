@@ -156,24 +156,32 @@ class UniStack(UniStackCore):
                 evaluation = evaluate_guardrail(policy, str(result), self._guardrail_context)
                 if not evaluation["passed"]:
                     activity_id = _current_activity.get()
-                    self._write_guardrail_entry(
-                        activity_id,
-                        node=fn.__name__,
-                        policy=policy,
-                        reason=evaluation["reason"],
-                        status="pending",
+                    # LangGraph re-runs the node from scratch on resume. Guard against
+                    # re-writing the hitl_queue entry if this specific breach was already
+                    # resolved (defence-in-depth alongside _guardrail_approved).
+                    existing = self._db.hitl_queue.find_one({"activity_id": activity_id})
+                    already_resolved = (
+                        existing
+                        and existing.get("type") == "guardrail_breach"
+                        and existing.get("guardrail_policy") == policy
+                        and existing.get("status") != "pending"
                     )
-                    # Write the hitl_queue entry here — at the interrupt site — so the
-                    # record exists before sdk.run() starts polling, and so any caller
-                    # that bypasses sdk.run() also gets the queue entry.
-                    self._write_hitl_entry(
-                        activity_id,
-                        type_="guardrail_breach",
-                        message=f"Guardrail breach: {evaluation['reason']}",
-                        data={},
-                        policy=policy,
-                        reason=evaluation["reason"],
-                    )
+                    if not already_resolved:
+                        self._write_guardrail_entry(
+                            activity_id,
+                            node=fn.__name__,
+                            policy=policy,
+                            reason=evaluation["reason"],
+                            status="pending",
+                        )
+                        self._write_hitl_entry(
+                            activity_id,
+                            type_="guardrail_breach",
+                            message=f"Guardrail breach: {evaluation['reason']}",
+                            data={},
+                            policy=policy,
+                            reason=evaluation["reason"],
+                        )
                     decision = interrupt({
                         "type": "guardrail_breach",
                         "policy": policy,
@@ -195,16 +203,28 @@ class UniStack(UniStackCore):
 
         Writes the hitl_queue entry immediately (before the interrupt is raised)
         so the record is visible to pollers as soon as the pause begins.
+
+        LangGraph re-runs the node from scratch on resume. The write is skipped
+        if this exact HITL entry is already resolved so the approved/rejected
+        status is not overwritten back to pending on the resume pass.
         """
         from langgraph.types import interrupt
         activity_id = _current_activity.get()
         if activity_id and activity_id != "unknown":
-            self._write_hitl_entry(
-                activity_id,
-                type_="hitl",
-                message=message,
-                data=data or {},
+            existing = self._db.hitl_queue.find_one({"activity_id": activity_id})
+            already_resolved = (
+                existing
+                and existing.get("type") == "hitl"
+                and existing.get("message") == message
+                and existing.get("status") != "pending"
             )
+            if not already_resolved:
+                self._write_hitl_entry(
+                    activity_id,
+                    type_="hitl",
+                    message=message,
+                    data=data or {},
+                )
         return interrupt({"message": message, "data": data or {}})
 
     # ── sdk.run() ────────────────────────────────────────────────────────────
@@ -262,6 +282,12 @@ class UniStack(UniStackCore):
                     and intr_value.get("type") == "guardrail_breach"
                 )
                 breached_node = intr_value.get("node") if is_guardrail_breach else None
+
+                # Flush node spans to MongoDB now so the visualizer reflects the
+                # correct pause state (paused node, completed predecessors) before
+                # the human is prompted. Without this, BatchSpanProcessor may
+                # buffer spans for up to 5 s before exporting.
+                self._provider.force_flush(timeout_millis=3000)
 
                 # hitl_queue entry was already written at the interrupt site
                 # (in sdk.hitl() or @sdk.guardrail). Just poll for the decision.
