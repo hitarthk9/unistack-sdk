@@ -3,7 +3,12 @@ import json
 from langsmith import traceable
 
 
-@traceable(name="guardrail_eval", run_type="llm")
+def _judge_trace_inputs(inputs: dict) -> dict:
+    """Log the judge's decision inputs to LangSmith — never the API key."""
+    return {k: inputs[k] for k in ("policy", "output", "context", "model") if k in inputs}
+
+
+@traceable(name="guardrail_eval", run_type="chain", process_inputs=_judge_trace_inputs)
 def evaluate_guardrail(
     policy: str,
     output: str,
@@ -20,7 +25,9 @@ def evaluate_guardrail(
     if api_key:
         import re
         import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        from langsmith.wrappers import wrap_anthropic
+        # wrap_anthropic traces the Claude call as a child LLM span with tokens + cost.
+        client = wrap_anthropic(anthropic.Anthropic(api_key=api_key))
         context_section = f"\nBusiness Context:\n{context}\n" if context else ""
         resp = client.messages.create(
             model=model,

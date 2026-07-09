@@ -39,7 +39,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from pymongo import MongoClient
 
 
-@traceable(name="hitl_pause", run_type="tool")
+def _hitl_trace_inputs(inputs: dict) -> dict:
+    """Log only the meaningful HITL inputs — never the Mongo client handle."""
+    return {"activity_id": inputs.get("activity_id"), "poll_interval": inputs.get("poll_interval")}
+
+
+@traceable(name="hitl_pause", run_type="tool", process_inputs=_hitl_trace_inputs)
 def _hitl_wait(activity_id: str, poll_interval: float, *, _queue) -> dict:
     """Blocks until a human resolves the HITL entry. Span duration = human response time."""
     while True:
@@ -82,8 +87,10 @@ class UniStack:
         self._guards: dict[str, str] = {}   # node -> policy text
         self._reviews: set[str] = set()     # nodes needing unconditional sign-off
 
-        # Enable LangSmith tracing when a key is supplied — every run then shows up in
-        # LangSmith named by activity_id and tagged by workflow (see run()'s config).
+        # Enable LangSmith tracing when a key is supplied. Every run of an activity is
+        # grouped into one LangSmith thread keyed by activity_id (see _thread_meta / run),
+        # so a workflow — whether it pauses for HITL or not — is always a single thread
+        # the brain can fetch uniformly.
         if langsmith_api_key:
             os.environ["LANGSMITH_TRACING"] = "true"
             os.environ["LANGSMITH_API_KEY"] = langsmith_api_key
@@ -119,10 +126,13 @@ class UniStack:
         resumes on approval. Halts and abandons the graph on rejection.
         """
         activity_id = f"{self._workflow}-{run_id}"
+        # Each graph segment is its own clean, native LangGraph trace. The thread metadata
+        # groups every segment (and the guardrail_eval / hitl_pause spans) under one
+        # LangSmith thread keyed by activity_id — see _thread_meta.
         config = {
             "configurable": {"thread_id": activity_id},
             "run_name":     activity_id,
-            "metadata":     {"activity_id": activity_id, "workflow": self._workflow},
+            "metadata":     self._thread_meta(activity_id),
             "tags":         [activity_id, self._workflow],
         }
 
@@ -150,6 +160,14 @@ class UniStack:
 
         return RunResult(activity_id, final_state, status)
 
+    def _thread_meta(self, activity_id: str) -> dict:
+        """
+        Metadata that groups every run of an activity into one LangSmith thread.
+        `thread_id` is a LangSmith-recognised thread key; the brain fetches an activity's
+        complete history by querying this thread — uniform whether or not it paused.
+        """
+        return {"thread_id": activity_id, "activity_id": activity_id, "workflow": self._workflow}
+
     # ── Gate ──────────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -174,7 +192,8 @@ class UniStack:
         A guard that passes auto-approves with no human involved.
         """
         if node in self._guards:
-            result = self.evaluate(self._guards[node], json.dumps(output, default=str))
+            result = self.evaluate(self._guards[node], json.dumps(output, default=str),
+                                   thread_id=activity_id)
             if result["passed"]:
                 print(f"\n[UniStack] guard[{node}] passed — continuing.")
                 return "approved"
@@ -190,16 +209,20 @@ class UniStack:
 
     # ── Guardrail evaluation ──────────────────────────────────────────────────
 
-    def evaluate(self, policy: str, output: str) -> dict:
+    def evaluate(self, policy: str, output: str, thread_id: str | None = None) -> dict:
         """
         Evaluate output against a policy using Claude (LLM-as-judge).
         Returns {"passed": bool, "reason": str}.
         Falls back to a keyword scan when no anthropic_api_key was supplied.
+
+        When thread_id is given, the guardrail_eval trace joins that LangSmith thread.
         """
         from unistack._guardrail import evaluate_guardrail
+        extra = {"metadata": self._thread_meta(thread_id)} if thread_id else None
         return evaluate_guardrail(
             policy, output, self._guardrail_context,
             api_key=self._anthropic_api_key, model=self._guardrail_model,
+            langsmith_extra=extra,
         )
 
     # ── HITL queue ────────────────────────────────────────────────────────────
@@ -224,7 +247,10 @@ class UniStack:
         print(f"\n[UniStack] Waiting for human decision on {activity_id}")
         print(f"  Resolve via your HITL API: POST /hitl/{activity_id}/resolve")
         print('       body: {"decision":"approve","resolved_by":"you@company.com"}')
-        result = _hitl_wait(activity_id, self._hitl_poll_interval, _queue=self._db.hitl_queue)
+        result = _hitl_wait(
+            activity_id, self._hitl_poll_interval, _queue=self._db.hitl_queue,
+            langsmith_extra={"metadata": self._thread_meta(activity_id)},
+        )
         print(f"\n[UniStack] Decision: {result['decision']}")
         return result["decision"]
 

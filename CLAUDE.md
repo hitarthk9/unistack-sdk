@@ -76,11 +76,39 @@ is abandoned.
 ## LangSmith tracing
 
 Pass `langsmith_api_key` (and optionally `langsmith_project`) to `UniStack.init()` and every run
-is traced in LangSmith — named by `activity_id` and tagged with the `workflow` (the SDK sets
-`run_name`/`tags`/`metadata` on the graph config). Under the hood the SDK sets
+is traced in LangSmith. Under the hood the SDK sets
 `LANGSMITH_TRACING`/`LANGSMITH_API_KEY`/`LANGSMITH_PROJECT` for the underlying LangChain tracer.
 Omit the key and tracing stays off — LangSmith ships as a transitive LangGraph dependency but
 stays dormant.
+
+### One activity = one LangSmith thread
+
+`sdk.run()` streams the graph once per breakpoint, so a HITL activity is several native traces
+(one graph segment per pause, plus a `guardrail_eval` / `hitl_pause` span at each gate). Rather
+than force these into one hand-stitched tree (which mixes LangChain-runtime and SDK-runtime runs
+and renders badly), the SDK groups them into a single **LangSmith thread** keyed by `activity_id`
+— it stamps `metadata.thread_id = activity_id` on every graph config, guardrail_eval, and
+hitl_pause span (see `_thread_meta`). Each trace stays clean and native; the thread ties them
+together.
+
+This is **uniform across every workflow**: a plain workflow that never pauses is just a thread
+with one trace; a HITL/guarded workflow is a thread with several. There is no "trace vs thread"
+fork.
+
+### Fetching an activity downstream (e.g. the brain)
+
+Always fetch by thread — one query, HITL or not:
+
+```python
+from langsmith import Client
+runs = Client().list_runs(
+    project_name=<project>,
+    filter=f'and(eq(metadata_key,"thread_id"),eq(metadata_value,"{activity_id}"))',
+)
+```
+
+Filtering to `is_root=True` and sorting by `start_time` yields the activity's timeline of events
+(graph segments, guard evaluations, HITL pauses); each root's children hold the detail.
 
 ## How run() works
 

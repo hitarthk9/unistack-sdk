@@ -47,8 +47,10 @@ print(result.status)   # "completed" | "hitl_rejected" | "failed"
 - **Guard** — after the node runs, an LLM judges its output against the policy. Pass → continue
   silently; breach → open a HITL pause.
 - **Review** — an unconditional human sign-off after the node.
-- **LangSmith** — pass `langsmith_api_key` and every run is traced, named by `activity_id` and
-  tagged with the `workflow`. Omit it and tracing stays off.
+- **LangSmith** — pass `langsmith_api_key` and every run is traced. All of an activity's
+  traces (graph segments, guard checks, HITL pauses) are grouped into one **LangSmith thread**
+  keyed by `activity_id`, so you fetch a run's full history with a single query — whether or not
+  it paused. Omit the key and tracing stays off.
 
 `sdk.run()` is blocking: it polls `unistack.hitl_queue` while paused and resumes when a human
 records a decision (approve → continue, reject → abandon).
