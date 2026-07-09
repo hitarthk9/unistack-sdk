@@ -9,12 +9,18 @@ after each guarded / reviewed node, then owns the run loop:
               policy. Passed → resume silently. Breached → open a HITL pause.
   - review  → unconditional human sign-off after the node, before continuing.
 
+All configuration is passed explicitly at init — the SDK reads no environment variables and
+loads no .env file. The consuming app owns its environment and hands the values in.
+
 Usage::
 
     from unistack import UniStack
     from my_app.graph import builder          # existing, untouched StateGraph
 
-    sdk   = UniStack.init("mongodb://localhost:27017", workflow="content",
+    sdk   = UniStack.init(workflow="content",
+                          mongo_uri="mongodb://localhost:27017",
+                          anthropic_api_key="sk-ant-...",
+                          langsmith_api_key="ls-...",   # optional: enables LangSmith tracing
                           context="Brand voice: professional, no unverified claims.")
     graph = sdk.compile(builder,
                         guards={"generate": "No unverified medical/financial claims."},
@@ -24,13 +30,12 @@ Usage::
 """
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 
 from langgraph.checkpoint.memory import MemorySaver
 from pymongo import MongoClient
-
-from unistack.config import API_URL, MONGO_URI
 
 
 class RunResult:
@@ -46,19 +51,32 @@ class UniStack:
     def __init__(
         self,
         workflow: str,
-        db_name: str = "unistack",
-        hitl_poll_interval: float = 2.0,
+        mongo_uri: str,
+        anthropic_api_key: str | None = None,
+        langsmith_api_key: str | None = None,
+        langsmith_project: str | None = None,
         context: str | None = None,
-        context_file: str | None = None,
+        db_name: str = "unistack",
+        guardrail_model: str = "claude-haiku-4-5-20251001",
+        hitl_poll_interval: float = 2.0,
     ):
         self._workflow = workflow
+        self._anthropic_api_key = anthropic_api_key
+        self._guardrail_model = guardrail_model
+        self._guardrail_context = context
         self._hitl_poll_interval = hitl_poll_interval
-        self._db = MongoClient(MONGO_URI)[db_name]
+        self._db = MongoClient(mongo_uri)[db_name]
         self._checkpointer = MemorySaver()
-        self._guardrail_context = self._resolve_context(context, context_file)
 
         self._guards: dict[str, str] = {}   # node -> policy text
         self._reviews: set[str] = set()     # nodes needing unconditional sign-off
+
+        # Enable LangSmith tracing when a key is supplied — every run then shows up in
+        # LangSmith named by activity_id and tagged by workflow (see run()'s config).
+        if langsmith_api_key:
+            os.environ["LANGSMITH_TRACING"] = "true"
+            os.environ["LANGSMITH_API_KEY"] = langsmith_api_key
+            os.environ["LANGSMITH_PROJECT"] = langsmith_project or workflow
 
     @classmethod
     def init(cls, *args, **kwargs) -> "UniStack":
@@ -163,12 +181,15 @@ class UniStack:
 
     def evaluate(self, policy: str, output: str) -> dict:
         """
-        Evaluate output against a policy using Claude Haiku (LLM-as-judge).
+        Evaluate output against a policy using Claude (LLM-as-judge).
         Returns {"passed": bool, "reason": str}.
-        Falls back to a keyword scan when ANTHROPIC_API_KEY is not set.
+        Falls back to a keyword scan when no anthropic_api_key was supplied.
         """
         from unistack._guardrail import evaluate_guardrail
-        return evaluate_guardrail(policy, output, self._guardrail_context)
+        return evaluate_guardrail(
+            policy, output, self._guardrail_context,
+            api_key=self._anthropic_api_key, model=self._guardrail_model,
+        )
 
     # ── HITL queue ────────────────────────────────────────────────────────────
 
@@ -190,9 +211,8 @@ class UniStack:
     def _poll_for_decision(self, activity_id: str) -> str:
         """Block until the hitl_queue entry is resolved. Returns 'approved' or 'rejected'."""
         print(f"\n[UniStack] Waiting for human decision on {activity_id}")
-        print(f"  curl -X POST {API_URL}/hitl/{activity_id}/resolve \\")
-        print(f'       -H "Content-Type: application/json" \\')
-        print(f'       -d \'{{"decision":"approve","resolved_by":"you@company.com"}}\'')
+        print(f"  Resolve via your HITL API: POST /hitl/{activity_id}/resolve")
+        print('       body: {"decision":"approve","resolved_by":"you@company.com"}')
         while True:
             doc = self._db.hitl_queue.find_one(
                 {"activity_id": activity_id, "status": {"$ne": "pending"}}
@@ -201,23 +221,6 @@ class UniStack:
                 print(f"\n[UniStack] Decision: {doc['status']}")
                 return doc["status"]
             time.sleep(self._hitl_poll_interval)
-
-    # ── Context loading ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _resolve_context(context: str | None, context_file: str | None) -> str | None:
-        """Load guardrail business context from an inline string or a YAML file."""
-        if context:
-            return context
-        if context_file:
-            try:
-                import yaml
-            except ImportError:
-                raise ImportError("pyyaml is required for context_file: pip install pyyaml")
-            with open(context_file) as f:
-                data = yaml.safe_load(f)
-            return data.get("guardrail_context")
-        return None
 
 
 __all__ = ["UniStack", "RunResult"]

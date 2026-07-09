@@ -15,8 +15,8 @@ from langgraph.graph import StateGraph
 from pymongo import MongoClient
 
 from unistack import UniStack
-from unistack.config import MONGO_URI
 
+MONGO_URI = "mongodb://localhost:27017"
 TEST_DB = "unistack_test"
 POLICY = "Output must not contain the word 'forbidden'."
 EVAL_TARGET = "unistack._guardrail.evaluate_guardrail"
@@ -42,6 +42,7 @@ def _wipe(db):
 def _sdk(workflow: str) -> UniStack:
     return UniStack.init(
         workflow=workflow,
+        mongo_uri=MONGO_URI,
         db_name=TEST_DB,
         hitl_poll_interval=0.1,
     )
@@ -220,20 +221,15 @@ def test_review_reject(clean_db):
 # ── Test 5: keyword-scan fallback (no API key) ────────────────────────────────
 
 def test_guardrail_keyword_fallback_breach():
-    import os
     from unistack._guardrail import evaluate_guardrail
 
-    saved = os.environ.pop("ANTHROPIC_API_KEY", None)
-    try:
-        result = evaluate_guardrail("No illegal activity", "This order is sanctioned and illegal")
-        assert result["passed"] is False
-        assert "sanctioned" in result["reason"] or "illegal" in result["reason"]
+    # No api_key → keyword scan.
+    result = evaluate_guardrail("No illegal activity", "This order is sanctioned and illegal")
+    assert result["passed"] is False
+    assert "sanctioned" in result["reason"] or "illegal" in result["reason"]
 
-        clean = evaluate_guardrail("No illegal activity", "Standard retail order, low risk")
-        assert clean["passed"] is True
-    finally:
-        if saved:
-            os.environ["ANTHROPIC_API_KEY"] = saved
+    clean = evaluate_guardrail("No illegal activity", "Standard retail order, low risk")
+    assert clean["passed"] is True
 
 
 # ── Test 6: two sequential guards, both breach, both approved ─────────────────
@@ -248,7 +244,7 @@ def test_two_sequential_guards_both_approved(clean_db):
 
     call_log = []
 
-    def mock_eval(policy, output, context=None):
+    def mock_eval(policy, output, context=None, **kwargs):
         call_log.append(output)
         return {"passed": False, "reason": "test breach"}
 

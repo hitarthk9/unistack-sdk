@@ -1,24 +1,26 @@
 import json
-import os
-
-from unistack.config import GUARDRAIL_MODEL
 
 
-def evaluate_guardrail(policy: str, output: str, context: str | None = None) -> dict:
+def evaluate_guardrail(
+    policy: str,
+    output: str,
+    context: str | None = None,
+    api_key: str | None = None,
+    model: str = "claude-haiku-4-5-20251001",
+) -> dict:
     """
     Returns {"passed": bool, "reason": str}.
-    Uses Claude Haiku if ANTHROPIC_API_KEY is set; falls back to keyword scan.
+    Uses Claude when api_key is supplied; falls back to a keyword scan otherwise.
     When context is provided, it is injected into the LLM prompt so the
     evaluator has workflow-specific business domain knowledge.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
         import re
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
         context_section = f"\nBusiness Context:\n{context}\n" if context else ""
         resp = client.messages.create(
-            model=GUARDRAIL_MODEL,
+            model=model,
             max_tokens=150,
             messages=[{
                 "role": "user",
