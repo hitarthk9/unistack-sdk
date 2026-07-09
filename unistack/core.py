@@ -34,8 +34,19 @@ import os
 import time
 from datetime import datetime, timezone
 
+from langsmith import traceable
 from langgraph.checkpoint.memory import MemorySaver
 from pymongo import MongoClient
+
+
+@traceable(name="hitl_pause", run_type="tool")
+def _hitl_wait(activity_id: str, poll_interval: float, *, _queue) -> dict:
+    """Blocks until a human resolves the HITL entry. Span duration = human response time."""
+    while True:
+        doc = _queue.find_one({"activity_id": activity_id, "status": {"$ne": "pending"}})
+        if doc:
+            return {"decision": doc["status"], "resolved_by": doc.get("resolved_by")}
+        time.sleep(poll_interval)
 
 
 class RunResult:
@@ -213,14 +224,9 @@ class UniStack:
         print(f"\n[UniStack] Waiting for human decision on {activity_id}")
         print(f"  Resolve via your HITL API: POST /hitl/{activity_id}/resolve")
         print('       body: {"decision":"approve","resolved_by":"you@company.com"}')
-        while True:
-            doc = self._db.hitl_queue.find_one(
-                {"activity_id": activity_id, "status": {"$ne": "pending"}}
-            )
-            if doc:
-                print(f"\n[UniStack] Decision: {doc['status']}")
-                return doc["status"]
-            time.sleep(self._hitl_poll_interval)
+        result = _hitl_wait(activity_id, self._hitl_poll_interval, _queue=self._db.hitl_queue)
+        print(f"\n[UniStack] Decision: {result['decision']}")
+        return result["decision"]
 
 
 __all__ = ["UniStack", "RunResult"]

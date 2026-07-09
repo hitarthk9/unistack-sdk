@@ -1,6 +1,9 @@
 import json
 
+from langsmith import traceable
 
+
+@traceable(name="guardrail_eval", run_type="llm")
 def evaluate_guardrail(
     policy: str,
     output: str,
