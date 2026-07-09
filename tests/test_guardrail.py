@@ -1,22 +1,21 @@
 """
-Guardrail tests for the LangGraph adapter.
+Guardrail + HITL tests for the static-breakpoint latch-on model.
 
 Scenarios covered:
-  1. Clean pass        — output is fine, evaluate_guardrail called once, graph completes;
-                         no guardrail doc written; checkpoints cleaned up after run
-  2. Breach → reject   — human rejects, result.status = "hitl_rejected";
-                         guardrail doc written with status="rejected"
-  3. Breach → approve  — human approves, result.status = "completed";
-                         evaluate_guardrail called EXACTLY ONCE (double-execution fix);
-                         guardrail doc written with status="approved"
-  4. Downstream nodes  — nodes after an approved breach still execute
-  5. Keyword fallback  — without an API key the keyword scan catches obvious violations
-  6. Two sequential    — two guarded nodes, both breach, both approved; each evaluated
-                         once; two guardrail docs written, both status="approved"
+  1. Guard clean pass   — guard passes, evaluate called once, no human, graph completes,
+                          no hitl_queue pause written, checkpoints cleaned up
+  2. Guard breach reject— guard breaches, human rejects, result.status = "hitl_rejected"
+  3. Guard breach approve— guard breaches, human approves, graph resumes and completes;
+                          evaluate called exactly once (resume moves forward, no re-run);
+                          downstream node still executes
+  4. Review pause       — a reviewed node (no guard) pauses unconditionally; approve completes,
+                          reject halts
+  5. Keyword fallback   — without an API key the keyword scan catches obvious violations
+  6. Two sequential     — two guarded nodes both breach and both are approved; evaluate
+                          called exactly once per node
 
 All tests use a real MongoDB (localhost:27017) with an isolated "unistack_test" database
-that is wiped before and after each test. The SDK's poll interval is set to 0.1s so tests
-complete quickly.
+that is wiped before and after each test. The poll interval is 0.1s so tests run quickly.
 """
 
 import threading
@@ -30,11 +29,12 @@ from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from pymongo import MongoClient
 
-from unistack.adapters.langgraph import UniStack
+from unistack import UniStack
 
 MONGO_URI = "mongodb://localhost:27017"
 TEST_DB = "unistack_test"
 POLICY = "Output must not contain the word 'forbidden'."
+EVAL_TARGET = "unistack._guardrail.evaluate_guardrail"
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ def clean_db():
 
 
 def _wipe(db):
-    for col in ["spans", "hitl_queue", "checkpoints", "checkpoint_writes", "guardrails"]:
+    for col in ["hitl_queue", "checkpoints", "checkpoint_writes"]:
         db[col].drop()
 
 
@@ -64,170 +64,113 @@ def _sdk(workflow: str) -> UniStack:
     )
 
 
-def _graph(sdk: UniStack, node_fn):
-    """Compile a minimal single-node LangGraph."""
-    class S(TypedDict):
-        value: str
-
-    builder = StateGraph(S)
-    builder.add_node("guarded", node_fn)
-    builder.add_edge(START, "guarded")
-    builder.add_edge("guarded", END)
-    return builder.compile(checkpointer=sdk.checkpointer)
-
-
-def _resolve(db, activity_id: str, decision: str, after: float = 0.15):
+def _resolve(_db, activity_id: str, decision: str, times: int = 1, after: float = 0.15):
     """
-    Simulate a human resolving the HITL queue entry.
-    Polls until the pending entry appears, then writes the decision.
-    Runs in a daemon thread so the test's main thread can block on sdk.run().
+    Simulate a human resolving the HITL queue entry `times` times (once per pause).
+    Each pause upserts a fresh pending entry keyed by activity_id; the worker waits
+    for a pending entry, writes the decision, and repeats. Runs in a daemon thread
+    with its own MongoDB client so it survives the fixture's client teardown.
     """
     def _worker():
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            if db.hitl_queue.find_one({"activity_id": activity_id, "status": "pending"}):
-                break
-            time.sleep(0.05)
-        time.sleep(after)
-        db.hitl_queue.update_one(
-            {"activity_id": activity_id},
-            {"$set": {
-                "status": decision,
-                "resolved_by": "test-runner",
-                "resolved_at": datetime.now(tz=timezone.utc),
-            }},
-        )
+        client = MongoClient(MONGO_URI)
+        db = client[TEST_DB]
+        try:
+            for _ in range(times):
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if db.hitl_queue.find_one({"activity_id": activity_id, "status": "pending"}):
+                        break
+                    time.sleep(0.05)
+                time.sleep(after)
+                db.hitl_queue.update_one(
+                    {"activity_id": activity_id, "status": "pending"},
+                    {"$set": {
+                        "status": decision,
+                        "resolved_by": "test-runner",
+                        "resolved_at": datetime.now(tz=timezone.utc),
+                    }},
+                )
+                time.sleep(0.25)  # let run() process and reach the next pause
+        finally:
+            client.close()
 
     threading.Thread(target=_worker, daemon=True).start()
 
 
-# ── Test 1: clean pass ────────────────────────────────────────────────────────
+# ── Test 1: guard clean pass (no human) ───────────────────────────────────────
 
-def test_guardrail_clean_pass(clean_db):
-    """
-    When the output is clean, evaluate_guardrail is called once and the graph
-    completes without any interrupt. No guardrail doc is written. Checkpoints
-    are cleaned up after the run.
-    """
+def test_guard_clean_pass(clean_db):
     sdk = _sdk("grd-clean")
 
-    @sdk.node
-    @sdk.guardrail(POLICY)
+    class S(TypedDict):
+        value: str
+
     def guarded(state):
         return {"value": "safe output"}
 
-    graph = _graph(sdk, guarded)
+    builder = StateGraph(S)
+    builder.add_node("guarded", guarded)
+    builder.add_edge(START, "guarded")
+    builder.add_edge("guarded", END)
+    graph = sdk.compile(builder, guards={"guarded": POLICY})
 
-    with patch("unistack.adapters.langgraph.evaluate_guardrail",
-               return_value={"passed": True, "reason": "ok"}) as mock_eval:
+    with patch(EVAL_TARGET, return_value={"passed": True, "reason": "ok"}) as mock_eval:
         result = sdk.run(graph, {"value": ""}, run_id="clean-1")
 
     assert result.status == "completed"
     mock_eval.assert_called_once()
-    # No breach → no guardrail doc
-    assert clean_db.guardrails.count_documents({}) == 0
+    # Passed guard needs no human → no pause left behind
+    assert clean_db.hitl_queue.count_documents({}) == 0
     # Checkpoints cleaned up after run completes
     assert clean_db.checkpoints.count_documents({}) == 0
 
 
-# ── Test 2: breach → human reject ─────────────────────────────────────────────
+# ── Test 2: guard breach → human reject ───────────────────────────────────────
 
-def test_guardrail_breach_reject(clean_db):
-    """
-    When a breach is detected and the human rejects, run() breaks out of the
-    loop directly (without resuming the graph), so result.status = "hitl_rejected".
-    evaluate_guardrail is called once.
-    """
+def test_guard_breach_reject(clean_db):
     sdk = _sdk("grd-reject")
     activity_id = "grd-reject-rej-1"
 
-    @sdk.node
-    @sdk.guardrail(POLICY)
+    class S(TypedDict):
+        value: str
+
     def guarded(state):
         return {"value": "forbidden content here"}
 
-    graph = _graph(sdk, guarded)
+    builder = StateGraph(S)
+    builder.add_node("guarded", guarded)
+    builder.add_edge(START, "guarded")
+    builder.add_edge("guarded", END)
+    graph = sdk.compile(builder, guards={"guarded": POLICY})
+
     _resolve(clean_db, activity_id, "rejected")
 
-    with patch("unistack.adapters.langgraph.evaluate_guardrail",
+    with patch(EVAL_TARGET,
                return_value={"passed": False, "reason": "contains forbidden"}) as mock_eval:
         result = sdk.run(graph, {"value": ""}, run_id="rej-1")
 
-    # run() handles rejection directly without resuming the graph, so the status
-    # is "hitl_rejected" (same as a rejected regular HITL), not "guardrail_breached".
     assert result.status == "hitl_rejected"
     mock_eval.assert_called_once()
-    # Guardrail doc written and resolved as rejected
-    grd = clean_db.guardrails.find_one({"activity_id": activity_id})
-    assert grd is not None, "Guardrail breach was not written to unistack.guardrails"
-    assert grd["node"] == "guarded"
-    assert grd["status"] == "rejected"
-    assert grd["resolved_at"] is not None
+    doc = clean_db.hitl_queue.find_one({"activity_id": activity_id})
+    assert doc is not None
+    assert doc["status"] == "rejected"
+    assert doc["resolved_at"] is not None
 
 
-# ── Test 3: breach → human approve (the double-evaluation fix) ────────────────
+# ── Test 3: guard breach → approve → downstream runs ──────────────────────────
 
-def test_guardrail_breach_approve_no_double_eval(clean_db):
-    """
-    When a breach is detected and the human approves, the graph resumes and
-    completes successfully.
-
-    The critical assertion: evaluate_guardrail must be called EXACTLY ONCE —
-    not twice. LangGraph re-runs the node function on resume (unavoidable), but
-    the SDK's _guardrail_approved flag must prevent re-evaluation of the same
-    output the human already reviewed.
-    """
+def test_guard_breach_approve_downstream_runs(clean_db):
     sdk = _sdk("grd-approve")
     activity_id = "grd-approve-apr-1"
-
-    @sdk.node
-    @sdk.guardrail(POLICY)
-    def guarded(state):
-        return {"value": "questionable content"}
-
-    graph = _graph(sdk, guarded)
-    _resolve(clean_db, activity_id, "approved")
-
-    with patch("unistack.adapters.langgraph.evaluate_guardrail",
-               return_value={"passed": False, "reason": "borderline"}) as mock_eval:
-        result = sdk.run(graph, {"value": ""}, run_id="apr-1")
-
-    assert result.status == "completed", (
-        f"Expected 'completed' after human approval, got '{result.status}'"
-    )
-    assert mock_eval.call_count == 1, (
-        f"evaluate_guardrail was called {mock_eval.call_count} times — "
-        f"expected 1. The double-evaluation fix is broken."
-    )
-    # Guardrail doc written and resolved as approved
-    grd = clean_db.guardrails.find_one({"activity_id": activity_id})
-    assert grd is not None, "Guardrail breach was not written to unistack.guardrails"
-    assert grd["node"] == "guarded"
-    assert grd["status"] == "approved"
-    assert grd["resolved_by"] == "test-runner"
-
-
-# ── Test 4: breach → approve → following nodes still run ──────────────────────
-
-def test_guardrail_approve_downstream_nodes_execute(clean_db):
-    """
-    After a guardrail breach is approved, nodes downstream of the guarded node
-    must still execute normally.
-    """
-    sdk = _sdk("grd-downstream")
-    activity_id = "grd-downstream-ds-1"
     downstream_ran = []
 
     class S(TypedDict):
         value: str
         done: bool
 
-    @sdk.node
-    @sdk.guardrail(POLICY)
     def guarded(state):
         return {"value": "borderline", "done": False}
 
-    @sdk.node
     def downstream(state):
         downstream_ran.append(True)
         return {"done": True}
@@ -238,25 +181,56 @@ def test_guardrail_approve_downstream_nodes_execute(clean_db):
     builder.add_edge(START, "guarded")
     builder.add_edge("guarded", "downstream")
     builder.add_edge("downstream", END)
-    graph = builder.compile(checkpointer=sdk.checkpointer)
+    graph = sdk.compile(builder, guards={"guarded": POLICY})
 
     _resolve(clean_db, activity_id, "approved")
 
-    with patch("unistack.adapters.langgraph.evaluate_guardrail",
-               return_value={"passed": False, "reason": "borderline"}):
-        result = sdk.run(graph, {"value": "", "done": False}, run_id="ds-1")
+    with patch(EVAL_TARGET,
+               return_value={"passed": False, "reason": "borderline"}) as mock_eval:
+        result = sdk.run(graph, {"value": "", "done": False}, run_id="apr-1")
 
     assert result.status == "completed"
-    assert downstream_ran, "Downstream node did not execute after guardrail approval"
+    assert mock_eval.call_count == 1, (
+        f"evaluate called {mock_eval.call_count}x — expected 1 (resume moves forward, "
+        f"the guarded node is not re-run)."
+    )
+    assert downstream_ran, "Downstream node did not execute after approval"
+
+
+# ── Test 4: review node (unconditional HITL, no guard) ────────────────────────
+
+def test_review_pause_approve_and_reject(clean_db):
+    class S(TypedDict):
+        value: str
+
+    def work(state):
+        return {"value": "output"}
+
+    def build(sdk):
+        builder = StateGraph(S)
+        builder.add_node("work", work)
+        builder.add_edge(START, "work")
+        builder.add_edge("work", END)
+        return sdk.compile(builder, reviews=["work"])
+
+    # Approve → completed
+    sdk = _sdk("rev")
+    graph = build(sdk)
+    _resolve(clean_db, "rev-ap", "approved")
+    result = sdk.run(graph, {"value": ""}, run_id="ap")
+    assert result.status == "completed"
+
+    # Reject → hitl_rejected
+    sdk = _sdk("rev")
+    graph = build(sdk)
+    _resolve(clean_db, "rev-rj", "rejected")
+    result = sdk.run(graph, {"value": ""}, run_id="rj")
+    assert result.status == "hitl_rejected"
 
 
 # ── Test 5: keyword-scan fallback (no API key) ────────────────────────────────
 
 def test_guardrail_keyword_fallback_breach(clean_db):
-    """
-    Without an API key, the keyword scanner catches explicit violations.
-    This exercises the fallback path in evaluate_guardrail directly.
-    """
     import os
     from unistack._guardrail import evaluate_guardrail
 
@@ -273,14 +247,11 @@ def test_guardrail_keyword_fallback_breach(clean_db):
             os.environ["ANTHROPIC_API_KEY"] = saved
 
 
-# ── Test 6: multiple sequential guardrail breaches (both approved) ─────────────
+# ── Test 6: two sequential guards, both breach, both approved ─────────────────
 
-def test_two_sequential_guardrail_breaches_both_approved(clean_db):
-    """
-    A workflow with two guardrail-decorated nodes where both breach and both
-    are approved. Each evaluate_guardrail call must happen exactly once per node.
-    """
+def test_two_sequential_guards_both_approved(clean_db):
     sdk = _sdk("grd-two")
+    activity_id = "grd-two-two-1"
 
     class S(TypedDict):
         a: str
@@ -292,13 +263,9 @@ def test_two_sequential_guardrail_breaches_both_approved(clean_db):
         call_log.append(output)
         return {"passed": False, "reason": "test breach"}
 
-    @sdk.node
-    @sdk.guardrail("Policy A")
     def node_a(state):
         return {"a": "output-a", "b": ""}
 
-    @sdk.node
-    @sdk.guardrail("Policy B")
     def node_b(state):
         return {"b": "output-b"}
 
@@ -308,50 +275,14 @@ def test_two_sequential_guardrail_breaches_both_approved(clean_db):
     builder.add_edge(START, "node_a")
     builder.add_edge("node_a", "node_b")
     builder.add_edge("node_b", END)
-    graph = builder.compile(checkpointer=sdk.checkpointer)
+    graph = sdk.compile(builder, guards={"node_a": "Policy A", "node_b": "Policy B"})
 
-    activity_id_a = "grd-two-two-1"
+    _resolve(clean_db, activity_id, "approved", times=2)
 
-    # We need to approve twice — once per node breach.
-    # Each approval is detected after the previous interrupt resolves.
-    approved = []
-
-    def double_approver():
-        db = MongoClient(MONGO_URI)[TEST_DB]
-        for _ in range(2):
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                doc = db.hitl_queue.find_one({"activity_id": activity_id_a, "status": "pending"})
-                if doc:
-                    break
-                time.sleep(0.05)
-            time.sleep(0.15)
-            db.hitl_queue.update_one(
-                {"activity_id": activity_id_a},
-                {"$set": {
-                    "status": "approved",
-                    "resolved_by": "test-runner",
-                    "resolved_at": datetime.now(tz=timezone.utc),
-                }},
-            )
-            approved.append(True)
-            # Give sdk.run() time to process and re-raise the next interrupt
-            time.sleep(0.3)
-
-    threading.Thread(target=double_approver, daemon=True).start()
-
-    with patch("unistack.adapters.langgraph.evaluate_guardrail", side_effect=mock_eval):
+    with patch(EVAL_TARGET, side_effect=mock_eval):
         result = sdk.run(graph, {"a": "", "b": ""}, run_id="two-1")
 
     assert result.status == "completed"
     assert len(call_log) == 2, (
-        f"evaluate_guardrail called {len(call_log)} times — expected exactly 2 "
-        f"(once per node, not twice per node). calls: {call_log}"
+        f"evaluate called {len(call_log)}x — expected exactly 2 (once per node)."
     )
-    # Both nodes should have guardrail docs, both approved
-    db = MongoClient(MONGO_URI)[TEST_DB]
-    grds = list(db.guardrails.find({"activity_id": activity_id_a}))
-    assert len(grds) == 2, f"Expected 2 guardrail docs, got {len(grds)}"
-    nodes = {g["node"] for g in grds}
-    assert nodes == {"node_a", "node_b"}
-    assert all(g["status"] == "approved" for g in grds)

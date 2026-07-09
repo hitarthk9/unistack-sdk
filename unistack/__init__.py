@@ -1,3 +1,3 @@
-from unistack.adapters.langgraph import UniStack
+from unistack.core import UniStack, RunResult
 
-__all__ = ["UniStack"]
+__all__ = ["UniStack", "RunResult"]

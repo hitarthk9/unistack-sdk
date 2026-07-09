@@ -2,22 +2,46 @@
 
 ## What this is
 
-The UniStack SDK instruments AI agents with business observability, guardrails, and human-in-the-loop (HITL) capabilities. It is framework-agnostic: the default adapter targets LangGraph; a native adapter works with any Python pipeline (raw Anthropic/OpenAI calls, CrewAI, AutoGen, etc.).
-
-Agent builders import this package and add three decorators — nothing else changes in their agent code.
+The UniStack SDK adds **guardrails** and **human-in-the-loop (HITL)** to an existing LangGraph
+agent — without the agent author changing a single node. You hand UniStack your `StateGraph`
+builder plus a map of which nodes to guard/review; it compiles the graph with static
+breakpoints and drives the pauses.
 
 This is a standalone pip-installable package. It has no dependency on other UniStack repos.
+
+## The whole integration (3 lines)
+
+```python
+from unistack import UniStack
+from my_app.graph import builder          # your existing, untouched StateGraph
+
+sdk   = UniStack.init("mongodb://localhost:27017", workflow="content",
+                      context="Brand voice: professional, no unverified claims.")
+graph = sdk.compile(builder,
+                    guards={"generate": "No unverified medical or financial claims."},
+                    reviews=["publish"])
+result = sdk.run(graph, {"topic": "..."}, run_id="2026-07-09")
+# result.status → "completed" | "hitl_rejected" | "failed"
+```
+
+Your nodes are plain functions. UniStack never asks you to import it inside them.
+
+## Concepts
+
+- **Guard** — attached to a node via `guards={node: policy}`. After the node runs, an LLM acts
+  as judge: it evaluates the node's output against the policy (plus the business `context`).
+  - **Passed** → the graph resumes silently, no human involved.
+  - **Breached** → a HITL pause opens with the breach reason; a human approves (resume) or
+    rejects (halt).
+- **Review** — attached via `reviews=[node]`. An **unconditional** human sign-off after the
+  node, before continuing. No LLM, always pauses.
+
+Both are just LangGraph **static breakpoints** (`interrupt_after`) under the hood. The graph
+topology is never modified — no extra nodes, edges, reducers, or conditional routing.
 
 ## Public API
 
 ```python
-# Default — LangGraph adapter (backwards-compatible)
-from unistack import UniStack
-
-# Explicit adapters
-from unistack.adapters.langgraph import UniStack        # same as above
-from unistack.adapters.native import UniStack           # any framework, no LangGraph
-
 sdk = UniStack.init(
     "mongodb://localhost:27017",
     workflow="my-workflow",
@@ -25,133 +49,103 @@ sdk = UniStack.init(
     context_file="context/my-workflow.yaml",                   # alternative to context=
 )
 
-@sdk.node                                     # trace any node/step
-def my_node(state): ...
+graph = sdk.compile(builder, guards={"node": "policy"}, reviews=["node2"])
+result = sdk.run(graph, initial_state, run_id="2026-07-09")
 
-@sdk.node
-@sdk.guardrail("Policy text")                 # LLM-evaluated policy check (apply BELOW @sdk.node)
-def checked_node(state): ...
-
-@sdk.node
-def approval_node(state):
-    sdk.hitl("Needs VP sign-off", data={...}) # trigger HITL pause
-    return {}
-
-# LangGraph adapter:
-graph = builder.compile(checkpointer=sdk.checkpointer)
-result = sdk.run(graph, initial_state, run_id="2026-06-29")
-
-# Native adapter:
-result = sdk.run(my_pipeline_fn, initial_input, run_id="2026-06-29")
-
-# result.activity_id  → "my-workflow-2026-06-29"
-# result.status       → "completed" | "hitl_rejected" | "guardrail_breached" | "failed"
+# Also available:
+sdk.evaluate("policy text", output_str)   # {"passed": bool, "reason": str} — raw guard check
+sdk.checkpointer                          # MongoDBSaver (used internally by compile)
 ```
 
-`sdk.run()` is **blocking** — it polls `unistack.hitl_queue` during HITL pauses and resumes automatically when the HITL API records a human decision.
+`sdk.run()` is **blocking** — it polls `unistack.hitl_queue` during pauses and resumes
+automatically when the HITL API records a human decision. On rejection it does **not** resume;
+the graph is abandoned and its checkpoint deleted.
+
+## How run() works
+
+```
+compile(builder, guards, reviews) → interrupt_after=[guarded + reviewed nodes]
+run():
+  loop:
+    stream the graph (stream_mode="updates") until the next breakpoint or END,
+      capturing the last node + its output and whether a breakpoint fired
+    if no breakpoint fired: done (ran to END)
+    gate(last_node, last_output):
+      guard  → evaluate output; passed = continue, breached = HITL pause
+      review → HITL pause
+    approved → resume with stream(None, config);  rejected → stop
+    if the gated node was terminal (no successor): done
+```
+
+A static breakpoint surfaces as a `{"__interrupt__": ()}` chunk in the stream — this fires
+even when the node's only successor is `END`, so guards/reviews on terminal nodes still pause
+(unlike checking `get_state().next`, which is already empty at END). Resuming uses
+`graph.stream(None, config)` — not `Command(resume=...)` (that is for dynamic `interrupt()`
+calls inside nodes, which this SDK does not require).
 
 ## Guardrail context
 
-Guardrail evaluators work best when they know the business domain. Pass it at init time:
+The LLM judge works best knowing the business domain. Pass it once at init:
 
 ```python
-# Option A — inline string (quick)
 sdk = UniStack.init(..., context="B2B wholesale, India only. Reject sanctioned regions.")
-
-# Option B — YAML file (structured, reusable)
-sdk = UniStack.init(..., context_file="context/adani-retail.yaml")
-```
-
-YAML file schema (only `guardrail_context` is used by the SDK; other fields are for documentation):
-```yaml
-workflow: adani-retail
-guardrail_context: |
-  Business: B2B wholesale platform ...
-  Compliance rules: ...
-  Fraud indicators: ...
+sdk = UniStack.init(..., context_file="context/my-workflow.yaml")  # uses `guardrail_context:` key
 ```
 
 ## File structure
 
 ```
 unistack/
-  __init__.py        ← re-exports UniStack from adapters.langgraph (backwards-compat)
-  core.py            ← UniStackCore: all framework-agnostic logic
-  adapters/
-    langgraph.py     ← UniStack: LangGraph nodes, interrupt/resume, MongoDBSaver
-    native.py        ← UniStack: blocking HITL, direct guardrail raise, any framework
-  _exporter.py       ← MongoDBSpanExporter — writes raw spans to MongoDB
-  _guardrail.py      ← GuardrailBreached + evaluate_guardrail() via Claude Haiku
-pyproject.toml       ← package metadata for pip install -e .
-requirements.txt     ← same deps as pyproject.toml
+  __init__.py      ← exports UniStack, RunResult
+  core.py          ← the whole UniStack class (init, compile, run, gate, hitl helpers)
+  _guardrail.py    ← evaluate_guardrail() via Claude Haiku (keyword-scan fallback)
+  config.py        ← GUARDRAIL_MODEL
+pyproject.toml
+requirements.txt
+tests/test_guardrail.py
 ```
 
 ## MongoDB — what this writes
 
-Database: `unistack` (configurable via `db_name` param)
+Database: `unistack` (configurable via `db_name`)
 
 | Collection | Written by | Purpose |
 |---|---|---|
-| `unistack.spans` | `_exporter.py` | One doc per node execution — raw OTel span |
-| `unistack.hitl_queue` | `sdk.hitl()` / `@sdk.guardrail` | One doc per HITL/guardrail pause — written at interrupt site |
-| `unistack.guardrails` | `@sdk.guardrail` | One doc per guardrail evaluation (pending → approved/rejected) |
-| `unistack.checkpoints` | LangGraph MongoDBSaver | Transient — auto-deleted after activity |
-| `unistack.checkpoint_writes` | LangGraph MongoDBSaver | Transient — auto-deleted after activity |
+| `unistack.hitl_queue` | `sdk.run()` | One doc per pause (guard breach or review) |
+| `unistack.checkpoints` | LangGraph MongoDBSaver | Transient — cleared at run start/end |
+| `unistack.checkpoint_writes` | LangGraph MongoDBSaver | Transient — cleared at run start/end |
 
-Spans shape:
+hitl_queue document:
+```json
+{
+  "activity_id": "content-2026-07-09",
+  "status": "pending | approved | rejected",
+  "message": "Guardrail breach after 'generate': ...",
+  "created_at": "ISODate",
+  "resolved_at": "ISODate | null",
+  "resolved_by": "string | null"
+}
 ```
-trace_id, span_id, parent_span_id, name, activity_id, workflow,
-start_time, end_time, duration_ms, status, attributes
-```
-
-Status values: `completed` | `failed` | `hitl_pending` | `guardrail_breached`
 
 ## Environment variables
 
 | Var | Required | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | No | LLM guardrail evaluation via Claude Haiku; falls back to keyword scan |
-| `MONGO_URI` | No | Passed explicitly to `UniStack.init()` — default `mongodb://localhost:27017` |
+| `ANTHROPIC_API_KEY` | No | LLM guardrail judge via Claude Haiku; falls back to keyword scan |
+| `UNISTACK_GUARDRAIL_MODEL` | No | Override the judge model (default `claude-haiku-4-5-20251001`) |
 
-## How to install
-
-```bash
-# Dev (editable — changes are live immediately):
-pip install -e .
-
-# From another repo that depends on this SDK:
-pip install -e ../unistack-sdk
-```
-
-## How to set up a dev environment
+## Install & test
 
 ```bash
 python3.13 -m venv venv
 venv/bin/python -m pip install -e .
-cp .env.example .env   # then fill in ANTHROPIC_API_KEY
+PYTHONPATH=. venv/bin/python -m pytest tests/ -v   # needs MongoDB on localhost:27017
 ```
 
 ## Hard constraints
 
-1. No LLM inference for deterministic computation — KRA arithmetic is pure Python.
-2. Never replace an existing OTel TracerProvider — attach to it.
-3. Activity IDs are human-readable: `{workflow}-{run_id}`. Never UUID.
-4. A LangGraph `GraphInterrupt` must not mark a span as failed — HITL pause is not an error.
-5. Guardrails use LLM evaluation — this is policy enforcement, not deterministic computation.
-
-## Decorator order matters
-
-`@sdk.node` must be the **outer** decorator; `@sdk.guardrail` must be **inner**:
-
-```python
-@sdk.node           # outer — catches GuardrailBreached from the inner wrapper
-@sdk.guardrail("policy")   # inner — evaluates output, raises or interrupts on breach
-def my_node(state): ...
-```
-
-## Downstream consumers of spans
-
-- `unistack-assembly` — assembles spans into nested activity documents
-- `unistack-api` — surfaces HITL queue items from `unistack.hitl_queue`
-
-This SDK has **no dependency** on those repos.
+1. Never modify the author's graph topology — guards/reviews are static breakpoints only.
+2. Activity IDs are human-readable: `{workflow}-{run_id}`. Never UUID.
+3. A HITL pause is not an error — never mark the run failed for a pause.
+4. Guardrails use LLM evaluation — policy enforcement, not deterministic computation.
+5. On rejection, `run()` does NOT resume — the graph is abandoned and its checkpoint deleted.
