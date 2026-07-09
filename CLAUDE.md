@@ -53,7 +53,6 @@ result = sdk.run(graph, initial_state, run_id="2026-07-09")
 
 # Also available:
 sdk.evaluate("policy text", output_str)   # {"passed": bool, "reason": str} — raw guard check
-sdk.checkpointer                          # MongoDBSaver (used internally by compile)
 ```
 
 `sdk.run()` is **blocking** — it polls `unistack.hitl_queue` during pauses and resumes
@@ -111,8 +110,6 @@ Database: `unistack` (configurable via `db_name`)
 | Collection | Written by | Purpose |
 |---|---|---|
 | `unistack.hitl_queue` | `sdk.run()` | One doc per pause (guard breach or review) |
-| `unistack.checkpoints` | LangGraph MongoDBSaver | Transient — cleared at run start/end |
-| `unistack.checkpoint_writes` | LangGraph MongoDBSaver | Transient — cleared at run start/end |
 
 hitl_queue document:
 ```json

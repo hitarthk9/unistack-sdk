@@ -27,7 +27,7 @@ import json
 import time
 from datetime import datetime, timezone
 
-from langgraph.checkpoint.mongodb import MongoDBSaver
+from langgraph.checkpoint.memory import MemorySaver
 from pymongo import MongoClient
 
 from unistack.config import API_URL, MONGO_URI
@@ -52,11 +52,9 @@ class UniStack:
         context_file: str | None = None,
     ):
         self._workflow = workflow
-        self._db_name = db_name
         self._hitl_poll_interval = hitl_poll_interval
-        self._client = MongoClient(MONGO_URI)
-        self._db = self._client[db_name]
-        self.checkpointer = MongoDBSaver(self._client, db_name=db_name)
+        self._db = MongoClient(MONGO_URI)[db_name]
+        self._checkpointer = MemorySaver()
         self._guardrail_context = self._resolve_context(context, context_file)
 
         self._guards: dict[str, str] = {}   # node -> policy text
@@ -81,7 +79,7 @@ class UniStack:
         self._guards = dict(guards or {})
         self._reviews = set(reviews or [])
         stops = list(self._guards) + [n for n in self._reviews if n not in self._guards]
-        return builder.compile(checkpointer=self.checkpointer, interrupt_after=stops)
+        return builder.compile(checkpointer=self._checkpointer, interrupt_after=stops)
 
     def run(self, graph, initial_state: dict, run_id: str) -> RunResult:
         """
@@ -99,11 +97,6 @@ class UniStack:
             "tags":         [activity_id, self._workflow],
         }
 
-        # Clear any stale checkpoint and hitl_queue from a previous run.
-        try:
-            self.checkpointer.delete_thread(activity_id)
-        except Exception:
-            pass
         self._db.hitl_queue.delete_many({"activity_id": activity_id})
 
         input_val = initial_state
@@ -125,10 +118,6 @@ class UniStack:
             raise
         finally:
             final_state = dict(graph.get_state(config).values)
-            try:
-                self.checkpointer.delete_thread(activity_id)
-            except Exception:
-                pass
 
         return RunResult(activity_id, final_state, status)
 

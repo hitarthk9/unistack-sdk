@@ -36,8 +36,7 @@ def clean_db():
 
 
 def _wipe(db):
-    for col in ["hitl_queue", "checkpoints", "checkpoint_writes"]:
-        db[col].drop()
+    db.hitl_queue.drop()
 
 
 def _sdk(workflow: str) -> UniStack:
@@ -102,7 +101,6 @@ def test_guard_clean_pass(clean_db):
     assert result.status == "completed"
     mock_eval.assert_called_once()
     assert clean_db.hitl_queue.count_documents({}) == 0
-    assert clean_db.checkpoints.count_documents({}) == 0
 
 
 # ── Test 2: guard breach → human reject ───────────────────────────────────────

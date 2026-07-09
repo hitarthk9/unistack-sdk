@@ -9,7 +9,6 @@ description = "Guardrails + human-in-the-loop for existing LangGraph agents"
 requires-python = ">=3.10"
 dependencies = [
     "langgraph==1.2.6",
-    "langgraph-checkpoint-mongodb>=0.4.0",
     "pymongo>=4.16.0",
     "anthropic>=0.40.0",
     "pyyaml>=6.0",
