@@ -15,7 +15,7 @@ This is a standalone pip-installable package. It has no dependency on other UniS
 from unistack import UniStack
 from my_app.graph import builder          # your existing, untouched StateGraph
 
-sdk   = UniStack.init("mongodb://localhost:27017", workflow="content",
+sdk   = UniStack.init(workflow="content",
                       context="Brand voice: professional, no unverified claims.")
 graph = sdk.compile(builder,
                     guards={"generate": "No unverified medical or financial claims."},
@@ -43,7 +43,6 @@ topology is never modified — no extra nodes, edges, reducers, or conditional r
 
 ```python
 sdk = UniStack.init(
-    "mongodb://localhost:27017",
     workflow="my-workflow",
     context="Business domain text for guardrail evaluation.",  # optional
     context_file="context/my-workflow.yaml",                   # alternative to context=
@@ -131,6 +130,8 @@ hitl_queue document:
 
 | Var | Required | Purpose |
 |---|---|---|
+| `MONGO_URI` | No | MongoDB connection string (default `mongodb://localhost:27017`) |
+| `UNISTACK_API_URL` | No | Base URL of the HITL API for the resolve hint (default `http://localhost:8000`) |
 | `ANTHROPIC_API_KEY` | No | LLM guardrail judge via Claude Haiku; falls back to keyword scan |
 | `UNISTACK_GUARDRAIL_MODEL` | No | Override the judge model (default `claude-haiku-4-5-20251001`) |
 

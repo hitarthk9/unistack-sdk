@@ -1,21 +1,6 @@
 """
-Guardrail + HITL tests for the static-breakpoint latch-on model.
-
-Scenarios covered:
-  1. Guard clean pass   — guard passes, evaluate called once, no human, graph completes,
-                          no hitl_queue pause written, checkpoints cleaned up
-  2. Guard breach reject— guard breaches, human rejects, result.status = "hitl_rejected"
-  3. Guard breach approve— guard breaches, human approves, graph resumes and completes;
-                          evaluate called exactly once (resume moves forward, no re-run);
-                          downstream node still executes
-  4. Review pause       — a reviewed node (no guard) pauses unconditionally; approve completes,
-                          reject halts
-  5. Keyword fallback   — without an API key the keyword scan catches obvious violations
-  6. Two sequential     — two guarded nodes both breach and both are approved; evaluate
-                          called exactly once per node
-
-All tests use a real MongoDB (localhost:27017) with an isolated "unistack_test" database
-that is wiped before and after each test. The poll interval is 0.1s so tests run quickly.
+Integration tests for UniStack guardrails + HITL (static-breakpoint model).
+Requires MongoDB on localhost:27017 (uses isolated "unistack_test" database).
 """
 
 import threading
@@ -30,8 +15,8 @@ from langgraph.graph import StateGraph
 from pymongo import MongoClient
 
 from unistack import UniStack
+from unistack.config import MONGO_URI
 
-MONGO_URI = "mongodb://localhost:27017"
 TEST_DB = "unistack_test"
 POLICY = "Output must not contain the word 'forbidden'."
 EVAL_TARGET = "unistack._guardrail.evaluate_guardrail"
@@ -57,19 +42,16 @@ def _wipe(db):
 
 def _sdk(workflow: str) -> UniStack:
     return UniStack.init(
-        MONGO_URI,
         workflow=workflow,
         db_name=TEST_DB,
         hitl_poll_interval=0.1,
     )
 
 
-def _resolve(_db, activity_id: str, decision: str, times: int = 1, after: float = 0.15):
+def _resolve(activity_id: str, decision: str, times: int = 1, after: float = 0.15):
     """
     Simulate a human resolving the HITL queue entry `times` times (once per pause).
-    Each pause upserts a fresh pending entry keyed by activity_id; the worker waits
-    for a pending entry, writes the decision, and repeats. Runs in a daemon thread
-    with its own MongoDB client so it survives the fixture's client teardown.
+    Runs in a daemon thread with its own MongoDB client so it survives fixture teardown.
     """
     def _worker():
         client = MongoClient(MONGO_URI)
@@ -119,9 +101,7 @@ def test_guard_clean_pass(clean_db):
 
     assert result.status == "completed"
     mock_eval.assert_called_once()
-    # Passed guard needs no human → no pause left behind
     assert clean_db.hitl_queue.count_documents({}) == 0
-    # Checkpoints cleaned up after run completes
     assert clean_db.checkpoints.count_documents({}) == 0
 
 
@@ -143,10 +123,9 @@ def test_guard_breach_reject(clean_db):
     builder.add_edge("guarded", END)
     graph = sdk.compile(builder, guards={"guarded": POLICY})
 
-    _resolve(clean_db, activity_id, "rejected")
+    _resolve(activity_id, "rejected")
 
-    with patch(EVAL_TARGET,
-               return_value={"passed": False, "reason": "contains forbidden"}) as mock_eval:
+    with patch(EVAL_TARGET, return_value={"passed": False, "reason": "contains forbidden"}) as mock_eval:
         result = sdk.run(graph, {"value": ""}, run_id="rej-1")
 
     assert result.status == "hitl_rejected"
@@ -183,10 +162,9 @@ def test_guard_breach_approve_downstream_runs(clean_db):
     builder.add_edge("downstream", END)
     graph = sdk.compile(builder, guards={"guarded": POLICY})
 
-    _resolve(clean_db, activity_id, "approved")
+    _resolve(activity_id, "approved")
 
-    with patch(EVAL_TARGET,
-               return_value={"passed": False, "reason": "borderline"}) as mock_eval:
+    with patch(EVAL_TARGET, return_value={"passed": False, "reason": "borderline"}) as mock_eval:
         result = sdk.run(graph, {"value": "", "done": False}, run_id="apr-1")
 
     assert result.status == "completed"
@@ -197,40 +175,53 @@ def test_guard_breach_approve_downstream_runs(clean_db):
     assert downstream_ran, "Downstream node did not execute after approval"
 
 
-# ── Test 4: review node (unconditional HITL, no guard) ────────────────────────
+# ── Test 4a: review node → approve ────────────────────────────────────────────
 
-def test_review_pause_approve_and_reject(clean_db):
+def test_review_approve(clean_db):
+    sdk = _sdk("rev-ap")
+
     class S(TypedDict):
         value: str
 
     def work(state):
         return {"value": "output"}
 
-    def build(sdk):
-        builder = StateGraph(S)
-        builder.add_node("work", work)
-        builder.add_edge(START, "work")
-        builder.add_edge("work", END)
-        return sdk.compile(builder, reviews=["work"])
+    builder = StateGraph(S)
+    builder.add_node("work", work)
+    builder.add_edge(START, "work")
+    builder.add_edge("work", END)
+    graph = sdk.compile(builder, reviews=["work"])
 
-    # Approve → completed
-    sdk = _sdk("rev")
-    graph = build(sdk)
-    _resolve(clean_db, "rev-ap", "approved")
-    result = sdk.run(graph, {"value": ""}, run_id="ap")
+    _resolve("rev-ap-go", "approved")
+    result = sdk.run(graph, {"value": ""}, run_id="go")
     assert result.status == "completed"
 
-    # Reject → hitl_rejected
-    sdk = _sdk("rev")
-    graph = build(sdk)
-    _resolve(clean_db, "rev-rj", "rejected")
-    result = sdk.run(graph, {"value": ""}, run_id="rj")
+
+# ── Test 4b: review node → reject ─────────────────────────────────────────────
+
+def test_review_reject(clean_db):
+    sdk = _sdk("rev-rj")
+
+    class S(TypedDict):
+        value: str
+
+    def work(state):
+        return {"value": "output"}
+
+    builder = StateGraph(S)
+    builder.add_node("work", work)
+    builder.add_edge(START, "work")
+    builder.add_edge("work", END)
+    graph = sdk.compile(builder, reviews=["work"])
+
+    _resolve("rev-rj-no", "rejected")
+    result = sdk.run(graph, {"value": ""}, run_id="no")
     assert result.status == "hitl_rejected"
 
 
 # ── Test 5: keyword-scan fallback (no API key) ────────────────────────────────
 
-def test_guardrail_keyword_fallback_breach(clean_db):
+def test_guardrail_keyword_fallback_breach():
     import os
     from unistack._guardrail import evaluate_guardrail
 
@@ -277,7 +268,7 @@ def test_two_sequential_guards_both_approved(clean_db):
     builder.add_edge("node_b", END)
     graph = sdk.compile(builder, guards={"node_a": "Policy A", "node_b": "Policy B"})
 
-    _resolve(clean_db, activity_id, "approved", times=2)
+    _resolve(activity_id, "approved", times=2)
 
     with patch(EVAL_TARGET, side_effect=mock_eval):
         result = sdk.run(graph, {"a": "", "b": ""}, run_id="two-1")

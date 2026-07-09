@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo import MongoClient
 
+from unistack.config import API_URL, MONGO_URI
+
 
 class RunResult:
     def __init__(self, activity_id: str, state: dict, status: str = "completed"):
@@ -43,7 +45,6 @@ class UniStack:
 
     def __init__(
         self,
-        mongo_uri: str,
         workflow: str,
         db_name: str = "unistack",
         hitl_poll_interval: float = 2.0,
@@ -53,7 +54,7 @@ class UniStack:
         self._workflow = workflow
         self._db_name = db_name
         self._hitl_poll_interval = hitl_poll_interval
-        self._client = MongoClient(mongo_uri)
+        self._client = MongoClient(MONGO_URI)
         self._db = self._client[db_name]
         self.checkpointer = MongoDBSaver(self._client, db_name=db_name)
         self._guardrail_context = self._resolve_context(context, context_file)
@@ -200,7 +201,7 @@ class UniStack:
     def _poll_for_decision(self, activity_id: str) -> str:
         """Block until the hitl_queue entry is resolved. Returns 'approved' or 'rejected'."""
         print(f"\n[UniStack] Waiting for human decision on {activity_id}")
-        print(f"  curl -X POST http://localhost:8000/hitl/{activity_id}/resolve \\")
+        print(f"  curl -X POST {API_URL}/hitl/{activity_id}/resolve \\")
         print(f'       -H "Content-Type: application/json" \\')
         print(f'       -d \'{{"decision":"approve","resolved_by":"you@company.com"}}\'')
         while True:
