@@ -271,3 +271,31 @@ def test_two_sequential_guards_both_approved(clean_db):
     assert len(call_log) == 2, (
         f"evaluate called {len(call_log)}x — expected exactly 2 (once per node)."
     )
+
+
+# ── Test 7: run_id defaults to a unique timestamp ─────────────────────────────
+
+def test_run_id_defaults_to_unique_timestamp(clean_db):
+    import re
+
+    sdk = _sdk("auto")
+
+    class S(TypedDict):
+        value: str
+
+    def work(state):
+        return {"value": "safe"}
+
+    builder = StateGraph(S)
+    builder.add_node("work", work)
+    builder.add_edge(START, "work")
+    builder.add_edge("work", END)
+    graph = sdk.compile(builder)   # no guards/reviews → runs straight to END
+
+    r1 = sdk.run(graph, {"value": ""})   # no run_id → timestamp default
+    r2 = sdk.run(graph, {"value": ""})
+
+    # Human-readable {workflow}-{YYYYMMDD}T{HHMMSS+microseconds}, never UUID; unique per run.
+    assert re.fullmatch(r"auto-\d{8}T\d{12}", r1.activity_id), r1.activity_id
+    assert re.fullmatch(r"auto-\d{8}T\d{12}", r2.activity_id), r2.activity_id
+    assert r1.activity_id != r2.activity_id

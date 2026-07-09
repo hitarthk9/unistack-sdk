@@ -25,7 +25,7 @@ Usage::
     graph = sdk.compile(builder,
                         guards={"generate": "No unverified medical/financial claims."},
                         reviews=["publish"])
-    result = sdk.run(graph, {"topic": "..."}, run_id="2026-07-09")
+    result = sdk.run(graph, {"topic": "..."})   # run_id defaults to a unique timestamp
     # result.status → "completed" | "hitl_rejected" | "failed"
 """
 
@@ -117,14 +117,18 @@ class UniStack:
         stops = list(self._guards) + [n for n in self._reviews if n not in self._guards]
         return builder.compile(checkpointer=self._checkpointer, interrupt_after=stops)
 
-    def run(self, graph, initial_state: dict, run_id: str) -> RunResult:
+    def run(self, graph, initial_state: dict, run_id: str | None = None) -> RunResult:
         """
         Execute a compiled graph as a UniStack activity.
 
         Blocking. Streams the graph; each time a static breakpoint fires it gates
         the node that just ran (guard evaluation or unconditional review) and
         resumes on approval. Halts and abandons the graph on rejection.
+
+        run_id defaults to a UTC microsecond timestamp so every activity gets a
+        unique, human-readable id; pass your own if you want a meaningful one.
         """
+        run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
         activity_id = f"{self._workflow}-{run_id}"
         # Each graph segment is its own clean, native LangGraph trace. The thread metadata
         # groups every segment (and the guardrail_eval / hitl_pause spans) under one

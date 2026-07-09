@@ -23,7 +23,7 @@ sdk   = UniStack.init(workflow="content",
 graph = sdk.compile(builder,
                     guards={"generate": "No unverified medical or financial claims."},
                     reviews=["publish"])
-result = sdk.run(graph, {"topic": "..."}, run_id="2026-07-09")
+result = sdk.run(graph, {"topic": "..."})   # run_id defaults to a unique timestamp
 # result.status → "completed" | "hitl_rejected" | "failed"
 ```
 
@@ -49,7 +49,7 @@ topology is never modified — no extra nodes, edges, reducers, or conditional r
 ```python
 sdk = UniStack.init(builder_config)   # see parameters below
 graph = sdk.compile(builder, guards={"node": "policy"}, reviews=["node2"])
-result = sdk.run(graph, initial_state, run_id="2026-07-09")
+result = sdk.run(graph, initial_state)   # run_id optional; defaults to a unique timestamp
 
 # Also available:
 sdk.evaluate("policy text", output_str)   # {"passed": bool, "reason": str} — raw guard check
@@ -191,7 +191,8 @@ PYTHONPATH=. venv/bin/python -m pytest tests/ -v   # needs MongoDB on localhost:
 ## Hard constraints
 
 1. Never modify the author's graph topology — guards/reviews are static breakpoints only.
-2. Activity IDs are human-readable: `{workflow}-{run_id}`. Never UUID.
+2. Activity IDs are human-readable: `{workflow}-{run_id}`. Never UUID. `run_id` defaults to a
+   UTC microsecond timestamp (unique + sortable) when the caller doesn't supply one.
 3. A HITL pause is not an error — never mark the run failed for a pause.
 4. Guardrails use LLM evaluation — policy enforcement, not deterministic computation.
 5. On rejection, `run()` does NOT resume — the graph is abandoned.

@@ -40,7 +40,7 @@ graph = sdk.compile(
     reviews=["publish"],                                                 # unconditional sign-off
 )
 
-result = sdk.run(graph, {"topic": "a new productivity app"}, run_id="2026-07-09")
+result = sdk.run(graph, {"topic": "a new productivity app"})   # run_id defaults to a unique timestamp
 print(result.status)   # "completed" | "hitl_rejected" | "failed"
 ```
 
