@@ -115,8 +115,10 @@ class UniStack:
         self._guards = dict(guards or {})
         self._reviews = set(reviews or [])
         stops = list(self._guards) + [n for n in self._reviews if n not in self._guards]
-        checkpointer = self._checkpointer or MongoDBSaver(self._mongo, db_name=self._db_name)
-        return builder.compile(checkpointer=checkpointer, interrupt_after=stops)
+        # Keep a handle on the checkpointer so a terminal activity can have its Mongo
+        # working-state deleted (see _delete_checkpoint). LangSmith traces are untouched.
+        self._checkpointer = self._checkpointer or MongoDBSaver(self._mongo, db_name=self._db_name)
+        return builder.compile(checkpointer=self._checkpointer, interrupt_after=stops)
 
     # ── Durable, non-blocking run cycle ─────────────────────────────────────────
 
@@ -141,14 +143,20 @@ class UniStack:
         Reject halts the activity. Approve advances to the next pause or END; when there
         is nothing left to run (a terminal pause, or an already-finished thread) it simply
         returns "completed", so a repeated approve is a harmless no-op.
+
+        Any terminal outcome (reject, or nothing left to run) deletes the thread's Mongo
+        checkpoints — nothing will ever resume from it again. `state.values` is captured
+        up front, so it is returned intact even after the delete.
         """
         config = self._config(activity_id)
         state = graph.get_state(config)
         self._close_pause_span(activity_id, self._checkpoint_id(graph, config), decision, resolved_by)
 
         if decision != "approved":               # reject always halts the activity
+            self._delete_checkpoint(activity_id)
             return RunResult(activity_id, dict(state.values), "hitl_rejected")
         if not state.next:                       # terminal pause or already done → nothing to run
+            self._delete_checkpoint(activity_id)
             return RunResult(activity_id, dict(state.values), "completed")
         return self._drive(graph, None, activity_id)   # resume from the checkpoint
 
@@ -169,12 +177,16 @@ class UniStack:
     # ── Drive loop (shared by start + resume) ──────────────────────────────────
 
     def _drive(self, graph, input_val, activity_id: str) -> RunResult:
-        """Advance the graph from input_val until a human pause or END; build a RunResult."""
+        """
+        Advance the graph from input_val until a human pause or END; build a RunResult.
+        Reaching END is terminal → the thread's Mongo checkpoints are deleted (nothing will
+        resume from it again). A pause keeps its checkpoint (that's what resume() loads).
+        """
         config = self._config(activity_id)
         while True:
             node, output, interrupted = self._stream_segment(graph, input_val, config)
             if not interrupted:
-                return RunResult(activity_id, self._values(graph, config), "completed")
+                return self._completed(graph, config, activity_id)   # ran to END
 
             if node in self._guards:
                 verdict = self.evaluate(self._guards[node], json.dumps(output, default=str),
@@ -183,7 +195,7 @@ class UniStack:
                     print(f"[UniStack] guard[{node}] passed — continuing.")
                     input_val = None
                     if not graph.get_state(config).next:
-                        return RunResult(activity_id, self._values(graph, config), "completed")
+                        return self._completed(graph, config, activity_id)   # passed on terminal node
                     continue
                 message = f"Guardrail breach after '{node}': {verdict['reason']}"
             elif node in self._reviews:
@@ -191,12 +203,18 @@ class UniStack:
             else:                                            # a breakpoint we don't own
                 input_val = None
                 if not graph.get_state(config).next:
-                    return RunResult(activity_id, self._values(graph, config), "completed")
+                    return self._completed(graph, config, activity_id)
                 continue
 
             print(f"[UniStack] paused after '{node}': {message}")
             self._open_pause_span(activity_id, node, message, self._checkpoint_id(graph, config))
             return RunResult(activity_id, self._values(graph, config), "paused", node, message)
+
+    def _completed(self, graph, config, activity_id: str) -> RunResult:
+        """Build a completed RunResult, capturing final state BEFORE deleting the checkpoints."""
+        values = self._values(graph, config)                 # read state first
+        self._delete_checkpoint(activity_id)                 # then wipe the terminal thread
+        return RunResult(activity_id, values, "completed")
 
     @staticmethod
     def _stream_segment(graph, input_val, config):
@@ -225,6 +243,18 @@ class UniStack:
     @staticmethod
     def _values(graph, config) -> dict:
         return dict(graph.get_state(config).values)
+
+    def _delete_checkpoint(self, activity_id: str) -> None:
+        """
+        Delete all Mongo checkpoint documents for a terminal activity (completed/rejected) —
+        nothing will ever resume from this thread again. Uses the checkpointer's own
+        delete_thread(); wrapped best-effort so a Mongo hiccup during cleanup can never
+        change the returned status/state. LangSmith's thread history is never touched.
+        """
+        try:
+            self._checkpointer.delete_thread(activity_id)
+        except Exception as exc:                             # cleanup is best-effort
+            print(f"[UniStack] could not delete checkpoints for {activity_id}: {exc}")
 
     # ── Guardrail evaluation ──────────────────────────────────────────────────
 

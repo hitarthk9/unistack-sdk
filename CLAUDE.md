@@ -144,11 +144,27 @@ unistack/
 pyproject.toml  requirements.txt  README.md  tests/test_guardrail.py
 ```
 
-## MongoDB — what this writes
+## MongoDB — what this writes (and cleans up)
 
 Database `unistack` (configurable). The SDK writes only the **durable checkpointer** collections
 (`checkpoints`, `checkpoint_writes`) — LangGraph's persisted graph state. There is **no**
 `hitl_queue`; the pending list + audit live in LangSmith.
+
+**Retention.** The moment an activity reaches a terminal outcome (completed or rejected), its
+thread is deleted via `MongoDBSaver.delete_thread(activity_id)` — nothing will ever resume from it
+again. So at steady state Mongo holds working-state only for genuinely in-flight / paused
+activities; nothing lingers after completion. Cleanup is best-effort (a Mongo hiccup logs and
+leaves docs) and never affects the returned status/state; LangSmith history is never touched.
+
+Notes:
+- We do **not** prune intermediate (resumed-past) checkpoints mid-activity: `MongoDBSaver.prune()`
+  is unimplemented (raises `NotImplementedError`), and hand-rolling schema-level deletes would be
+  fragile and can silently corrupt graphs using the experimental `DeltaChannel`. Those intermediate
+  docs are small and deleted anyway when the activity terminates.
+- **Abandoned** activities (started, paused, never resolved) keep their checkpoint indefinitely —
+  correctly, since it is still resumable. If you want to reap them, set a `MongoDBSaver` `ttl`
+  **longer than your worst-case approval SLA** (too short would delete a live pause and break
+  resume). Off by default so the default path can never delete a live pause.
 
 ## Environment variables
 
@@ -174,3 +190,5 @@ PYTHONPATH=. venv/bin/python -m pytest tests/ -v   # needs MongoDB on localhost:
 5. On rejection, the activity is abandoned (not resumed).
 6. State lives in the durable checkpointer; LangSmith is discovery/audit only. Resume must never
    depend on LangSmith being reachable.
+7. A terminal activity's checkpoints are deleted (best-effort); read final state BEFORE deleting.
+   Cleanup failures must never change the returned status/state.

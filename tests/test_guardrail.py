@@ -183,6 +183,80 @@ def test_run_convenience_drives_pauses_and_ids_are_unique():
     assert r1.activity_id != r2.activity_id
 
 
+# ── Checkpoint cleanup (Mongo working-state trimmed at terminal outcomes) ───────
+
+def _checkpoints(db, activity_id: str) -> int:
+    return db.checkpoints.count_documents({"thread_id": activity_id})
+
+
+def test_checkpoints_kept_while_paused_deleted_on_completion(clean_db):
+    sdk = _sdk("ck-cmp")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "paused"
+    assert _checkpoints(clean_db, r.activity_id) > 0        # kept while a human is needed
+    r2 = sdk.resume(graph, r.activity_id, "approved")
+    assert r2.status == "completed"
+    assert _checkpoints(clean_db, r.activity_id) == 0       # wiped once terminal
+
+
+def test_checkpoints_deleted_on_reject(clean_db):
+    sdk = _sdk("ck-rej")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    sdk.resume(graph, r.activity_id, "rejected")
+    assert _checkpoints(clean_db, r.activity_id) == 0
+
+
+def test_checkpoints_deleted_on_clean_pass(clean_db):
+    sdk = _sdk("ck-clean")
+    graph = sdk.compile(_one_node_graph("gen"), guards={"gen": "policy"})
+    with patch(EVAL_TARGET, side_effect=_passes):
+        r = sdk.start(graph, {"a": "", "b": ""})           # passes, never pauses → straight to END
+    assert r.status == "completed"
+    assert _checkpoints(clean_db, r.activity_id) == 0
+
+
+def test_double_resume_after_delete_is_safe(clean_db):
+    sdk = _sdk("ck-idem")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    assert sdk.resume(graph, r.activity_id, "approved").status == "completed"
+    assert _checkpoints(clean_db, r.activity_id) == 0
+    # resolving an already-deleted thread must not throw; get_state returns an empty snapshot
+    again = sdk.resume(graph, r.activity_id, "approved")
+    assert again.status == "completed"
+
+
+def test_messages_state_graph_completes_and_cleans_up(clean_db):
+    """The ubiquitous add_messages accumulating reducer runs start→pause→resume→END fine,
+    keeps its accumulated state, and leaves zero checkpoints behind."""
+    from langgraph.graph import MessagesState
+
+    def greet(state):
+        return {"messages": [("ai", "hello")]}
+
+    def finish(state):
+        return {"messages": [("ai", "done")]}
+
+    b = StateGraph(MessagesState)
+    b.add_node("greet", greet)
+    b.add_node("finish", finish)
+    b.add_edge(START, "greet")
+    b.add_edge("greet", "finish")
+    b.add_edge("finish", END)
+
+    sdk = _sdk("ck-msgs")
+    graph = sdk.compile(b, reviews=["greet"])
+    r = sdk.start(graph, {"messages": [("human", "hi")]})
+    assert r.status == "paused"
+    r2 = sdk.resume(graph, r.activity_id, "approved")
+    assert r2.status == "completed"
+    # accumulating reducer preserved the full conversation, and cleanup left nothing behind
+    assert len(r2.state["messages"]) == 3                   # human hi + ai hello + ai done
+    assert _checkpoints(clean_db, r.activity_id) == 0
+
+
 # ── Guardrail keyword fallback (no API key) ─────────────────────────────────────
 
 def test_guardrail_keyword_fallback_breach():
