@@ -1,14 +1,16 @@
 # UniStack SDK
 
-Add **guardrails** and **human-in-the-loop (HITL)** to an existing LangGraph agent — without
-changing a single node. You hand UniStack your `StateGraph` builder plus a map of which nodes to
-guard or review; it compiles the graph with static breakpoints and drives the pauses.
+Add **guardrails** and **durable human-in-the-loop (HITL)** to an existing LangGraph agent —
+without changing a single node. You hand UniStack your `StateGraph` builder plus a map of which
+nodes to guard or review; it compiles the graph with static breakpoints **and a durable
+checkpointer**, then drives the pauses. An activity can pause for a human and resume later, in a
+different process, after a restart.
 
 ## Install
 
 ```bash
-pip install -e .          # from a clone
-# or: pip install git+https://github.com/hitarthk9/unistack-sdk.git
+pip install -e ".[server]"          # from a clone (server extra = the `unistack serve` runtime)
+# or: pip install "git+https://github.com/hitarthk9/unistack-sdk.git#egg=unistack[server]"
 ```
 
 Requires Python ≥ 3.10 and a reachable MongoDB.
@@ -40,20 +42,35 @@ graph = sdk.compile(
     reviews=["publish"],                                                 # unconditional sign-off
 )
 
-result = sdk.run(graph, {"topic": "a new productivity app"})   # run_id defaults to a unique timestamp
-print(result.status)   # "completed" | "hitl_rejected" | "failed"
+# Local dev — blocks and asks for each decision on the terminal:
+result = sdk.run(graph, {"topic": "a new productivity app"})
+print(result.status)   # "completed" | "hitl_rejected"
 ```
 
-- **Guard** — after the node runs, an LLM judges its output against the policy. Pass → continue
-  silently; breach → open a HITL pause.
+For production, don't block — **start** and later **resume** (state is durable, so these can be
+different requests / processes):
+
+```python
+r = sdk.start(graph, {"topic": "..."})              # -> status "paused" | "completed"
+r = sdk.resume(graph, r.activity_id, "approved")    # continue; may pause again or complete
+```
+
+…or just serve the graph as a durable runtime — no boilerplate:
+
+```bash
+unistack serve my_app.graph:builder --workflow content \
+  --guard "generate=No unverified claims." --review publish
+# POST /activities  ·  POST /activities/{id}/resolve
+```
+
+- **Guard** — after the node runs, an LLM judges its output against the policy. Pass → continue;
+  breach → a HITL pause.
 - **Review** — an unconditional human sign-off after the node.
-- **LangSmith** — pass `langsmith_api_key` and every run is traced. All of an activity's
-  traces (graph segments, guard checks, HITL pauses) are grouped into one **LangSmith thread**
-  keyed by `activity_id`, so you fetch a run's full history with a single query — whether or not
-  it paused. Omit the key and tracing stays off.
+- **Durable** — graph state is persisted by a MongoDB checkpointer; a paused activity survives a
+  restart and can be resumed by any process. No blocking, no Mongo queue.
+- **LangSmith** — each activity is one **thread** keyed by `activity_id`; an open `hitl_pause`
+  span is a pending approval and the closed one is the audit. Listing pending / fetching a thread
+  reads straight from LangSmith (no SDK). Omit the key and tracing stays off.
 
-`sdk.run()` is blocking: it polls `unistack.hitl_queue` while paused and resumes when a human
-records a decision (approve → continue, reject → abandon).
-
-See [CLAUDE.md](CLAUDE.md) for the full reference (parameters, run loop internals, MongoDB
-schema, hard constraints).
+See [CLAUDE.md](CLAUDE.md) for the full reference (start/resume, the runtime, LangSmith index,
+hard constraints).

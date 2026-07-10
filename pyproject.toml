@@ -9,10 +9,20 @@ description = "Guardrails + human-in-the-loop for existing LangGraph agents"
 requires-python = ">=3.10"
 dependencies = [
     "langgraph==1.2.6",
+    "langgraph-checkpoint-mongodb>=0.4",
     "pymongo>=4.16.0",
     "anthropic>=0.40.0",
     "langsmith>=0.3",
 ]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.scripts]
+unistack = "unistack.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

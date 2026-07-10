@@ -1,4 +1,8 @@
 langgraph==1.2.6
+langgraph-checkpoint-mongodb>=0.4
 pymongo>=4.16.0
 anthropic>=0.40.0
 langsmith>=0.3
+
+# Optional (graph-runtime server / `unistack serve`):
+#   pip install -e ".[server]"   → fastapi, uvicorn

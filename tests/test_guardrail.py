@@ -1,32 +1,30 @@
 """
-Integration tests for UniStack guardrails + HITL (static-breakpoint model).
+Integration tests for UniStack guardrails + durable HITL (start / resume model).
 Requires MongoDB on localhost:27017 (uses isolated "unistack_test" database).
+
+Tracing is off in tests (no LangSmith key) so the hitl_pause span open/close are no-ops
+and nothing hits the network. start()/resume() are synchronous — no threads or polling.
 """
 
-import threading
-import time
-from datetime import datetime, timezone
+import re
 from typing import TypedDict
 from unittest.mock import patch
 
-import pytest
 from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from pymongo import MongoClient
+
+import pytest
 
 from unistack import UniStack
 
 MONGO_URI = "mongodb://localhost:27017"
 TEST_DB = "unistack_test"
-POLICY = "Output must not contain the word 'forbidden'."
 EVAL_TARGET = "unistack._guardrail.evaluate_guardrail"
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
 @pytest.fixture(autouse=True)
 def clean_db():
-    """Wipe the test database before and after every test."""
     client = MongoClient(MONGO_URI)
     db = client[TEST_DB]
     _wipe(db)
@@ -36,266 +34,161 @@ def clean_db():
 
 
 def _wipe(db):
-    db.hitl_queue.drop()
+    for c in ("checkpoints", "checkpoint_writes"):
+        db[c].drop()
 
 
 def _sdk(workflow: str) -> UniStack:
-    return UniStack.init(
-        workflow=workflow,
-        mongo_uri=MONGO_URI,
-        db_name=TEST_DB,
-        hitl_poll_interval=0.1,
-    )
+    return UniStack.init(workflow=workflow, mongo_uri=MONGO_URI, db_name=TEST_DB)
 
 
-def _resolve(activity_id: str, decision: str, times: int = 1, after: float = 0.15):
-    """
-    Simulate a human resolving the HITL queue entry `times` times (once per pause).
-    Runs in a daemon thread with its own MongoDB client so it survives fixture teardown.
-    """
-    def _worker():
-        client = MongoClient(MONGO_URI)
-        db = client[TEST_DB]
-        try:
-            for _ in range(times):
-                deadline = time.time() + 5
-                while time.time() < deadline:
-                    if db.hitl_queue.find_one({"activity_id": activity_id, "status": "pending"}):
-                        break
-                    time.sleep(0.05)
-                time.sleep(after)
-                db.hitl_queue.update_one(
-                    {"activity_id": activity_id, "status": "pending"},
-                    {"$set": {
-                        "status": decision,
-                        "resolved_by": "test-runner",
-                        "resolved_at": datetime.now(tz=timezone.utc),
-                    }},
-                )
-                time.sleep(0.25)  # let run() process and reach the next pause
-        finally:
-            client.close()
-
-    threading.Thread(target=_worker, daemon=True).start()
+class S(TypedDict):
+    a: str
+    b: str
 
 
-# ── Test 1: guard clean pass (no human) ───────────────────────────────────────
+def _one_node_graph(name: str):
+    def node(state):
+        return {"a": "output", "b": ""}
+    b = StateGraph(S)
+    b.add_node(name, node)
+    b.add_edge(START, name)
+    b.add_edge(name, END)
+    return b
 
-def test_guard_clean_pass(clean_db):
+
+def _two_node_graph():
+    def node_a(state):
+        return {"a": "out-a", "b": ""}
+
+    def node_b(state):
+        return {"b": "out-b"}
+    b = StateGraph(S)
+    b.add_node("node_a", node_a)
+    b.add_node("node_b", node_b)
+    b.add_edge(START, "node_a")
+    b.add_edge("node_a", "node_b")
+    b.add_edge("node_b", END)
+    return b
+
+
+def _passes(*a, **k):
+    return {"passed": True, "reason": "ok"}
+
+
+def _breaches(*a, **k):
+    return {"passed": False, "reason": "test breach"}
+
+
+# ── Guards ─────────────────────────────────────────────────────────────────────
+
+def test_guard_clean_pass_completes_without_pause():
     sdk = _sdk("grd-clean")
-
-    class S(TypedDict):
-        value: str
-
-    def guarded(state):
-        return {"value": "safe output"}
-
-    builder = StateGraph(S)
-    builder.add_node("guarded", guarded)
-    builder.add_edge(START, "guarded")
-    builder.add_edge("guarded", END)
-    graph = sdk.compile(builder, guards={"guarded": POLICY})
-
-    with patch(EVAL_TARGET, return_value={"passed": True, "reason": "ok"}) as mock_eval:
-        result = sdk.run(graph, {"value": ""}, run_id="clean-1")
-
-    assert result.status == "completed"
-    mock_eval.assert_called_once()
-    assert clean_db.hitl_queue.count_documents({}) == 0
+    graph = sdk.compile(_one_node_graph("gen"), guards={"gen": "policy"})
+    with patch(EVAL_TARGET, side_effect=_passes) as mock:
+        r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "completed"          # a passing guard never pauses
+    assert mock.call_count == 1
 
 
-# ── Test 2: guard breach → human reject ───────────────────────────────────────
-
-def test_guard_breach_reject(clean_db):
-    sdk = _sdk("grd-reject")
-    activity_id = "grd-reject-rej-1"
-
-    class S(TypedDict):
-        value: str
-
-    def guarded(state):
-        return {"value": "forbidden content here"}
-
-    builder = StateGraph(S)
-    builder.add_node("guarded", guarded)
-    builder.add_edge(START, "guarded")
-    builder.add_edge("guarded", END)
-    graph = sdk.compile(builder, guards={"guarded": POLICY})
-
-    _resolve(activity_id, "rejected")
-
-    with patch(EVAL_TARGET, return_value={"passed": False, "reason": "contains forbidden"}) as mock_eval:
-        result = sdk.run(graph, {"value": ""}, run_id="rej-1")
-
-    assert result.status == "hitl_rejected"
-    mock_eval.assert_called_once()
-    doc = clean_db.hitl_queue.find_one({"activity_id": activity_id})
-    assert doc is not None
-    assert doc["status"] == "rejected"
-    assert doc["resolved_at"] is not None
+def test_guard_breach_pauses_then_reject_halts():
+    sdk = _sdk("grd-rej")
+    graph = sdk.compile(_one_node_graph("gen"), guards={"gen": "policy"})
+    with patch(EVAL_TARGET, side_effect=_breaches):
+        r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "paused" and r.node == "gen"
+    r2 = sdk.resume(graph, r.activity_id, "rejected", resolved_by="t")
+    assert r2.status == "hitl_rejected"
 
 
-# ── Test 3: guard breach → approve → downstream runs ──────────────────────────
-
-def test_guard_breach_approve_downstream_runs(clean_db):
-    sdk = _sdk("grd-approve")
-    activity_id = "grd-approve-apr-1"
-    downstream_ran = []
-
-    class S(TypedDict):
-        value: str
-        done: bool
-
-    def guarded(state):
-        return {"value": "borderline", "done": False}
-
-    def downstream(state):
-        downstream_ran.append(True)
-        return {"done": True}
-
-    builder = StateGraph(S)
-    builder.add_node("guarded", guarded)
-    builder.add_node("downstream", downstream)
-    builder.add_edge(START, "guarded")
-    builder.add_edge("guarded", "downstream")
-    builder.add_edge("downstream", END)
-    graph = sdk.compile(builder, guards={"guarded": POLICY})
-
-    _resolve(activity_id, "approved")
-
-    with patch(EVAL_TARGET, return_value={"passed": False, "reason": "borderline"}) as mock_eval:
-        result = sdk.run(graph, {"value": "", "done": False}, run_id="apr-1")
-
-    assert result.status == "completed"
-    assert mock_eval.call_count == 1, (
-        f"evaluate called {mock_eval.call_count}x — expected 1 (resume moves forward, "
-        f"the guarded node is not re-run)."
-    )
-    assert downstream_ran, "Downstream node did not execute after approval"
+def test_guard_breach_approve_runs_downstream():
+    sdk = _sdk("grd-apr")
+    graph = sdk.compile(_two_node_graph(), guards={"node_a": "policy"})
+    with patch(EVAL_TARGET, side_effect=_breaches) as mock:
+        r = sdk.start(graph, {"a": "", "b": ""})
+        assert r.status == "paused" and r.node == "node_a"
+        r2 = sdk.resume(graph, r.activity_id, "approved")
+    assert r2.status == "completed"
+    assert r2.state["b"] == "out-b"          # downstream node_b ran after approval
+    assert mock.call_count == 1              # guarded node judged exactly once
 
 
-# ── Test 4a: review node → approve ────────────────────────────────────────────
+# ── Reviews ────────────────────────────────────────────────────────────────────
 
-def test_review_approve(clean_db):
-    sdk = _sdk("rev-ap")
-
-    class S(TypedDict):
-        value: str
-
-    def work(state):
-        return {"value": "output"}
-
-    builder = StateGraph(S)
-    builder.add_node("work", work)
-    builder.add_edge(START, "work")
-    builder.add_edge("work", END)
-    graph = sdk.compile(builder, reviews=["work"])
-
-    _resolve("rev-ap-go", "approved")
-    result = sdk.run(graph, {"value": ""}, run_id="go")
-    assert result.status == "completed"
+def test_review_pause_then_approve_completes():
+    sdk = _sdk("rev-apr")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "paused" and r.node == "work"
+    r2 = sdk.resume(graph, r.activity_id, "approved")
+    assert r2.status == "completed"
 
 
-# ── Test 4b: review node → reject ─────────────────────────────────────────────
-
-def test_review_reject(clean_db):
-    sdk = _sdk("rev-rj")
-
-    class S(TypedDict):
-        value: str
-
-    def work(state):
-        return {"value": "output"}
-
-    builder = StateGraph(S)
-    builder.add_node("work", work)
-    builder.add_edge(START, "work")
-    builder.add_edge("work", END)
-    graph = sdk.compile(builder, reviews=["work"])
-
-    _resolve("rev-rj-no", "rejected")
-    result = sdk.run(graph, {"value": ""}, run_id="no")
-    assert result.status == "hitl_rejected"
+def test_review_reject_halts():
+    sdk = _sdk("rev-rej")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    r2 = sdk.resume(graph, r.activity_id, "rejected")
+    assert r2.status == "hitl_rejected"
 
 
-# ── Test 5: keyword-scan fallback (no API key) ────────────────────────────────
+# ── Multiple HITL in one activity ───────────────────────────────────────────────
+
+def test_two_sequential_guards_both_breach_both_approved():
+    sdk = _sdk("grd-two")
+    graph = sdk.compile(_two_node_graph(), guards={"node_a": "A", "node_b": "B"})
+    with patch(EVAL_TARGET, side_effect=_breaches) as mock:
+        r = sdk.start(graph, {"a": "", "b": ""})
+        assert r.status == "paused" and r.node == "node_a"
+        r = sdk.resume(graph, r.activity_id, "approved")
+        assert r.status == "paused" and r.node == "node_b"     # advanced to the next pause
+        r = sdk.resume(graph, r.activity_id, "approved")
+    assert r.status == "completed"
+    assert mock.call_count == 2              # once per guarded node
+
+
+# ── Durability: resume survives a process restart ───────────────────────────────
+
+def test_durability_resume_in_fresh_instance():
+    sdk_a = _sdk("dur")
+    graph_a = sdk_a.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk_a.start(graph_a, {"a": "", "b": ""})
+    assert r.status == "paused"
+
+    # brand-new SDK + compile = a different process after a restart; state loads from Mongo
+    sdk_b = _sdk("dur")
+    graph_b = sdk_b.compile(_one_node_graph("work"), reviews=["work"])
+    r2 = sdk_b.resume(graph_b, r.activity_id, "approved", resolved_by="other-process")
+    assert r2.status == "completed"
+
+
+def test_double_resume_is_idempotent():
+    sdk = _sdk("idem")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    assert sdk.resume(graph, r.activity_id, "approved").status == "completed"
+    # a second resolve on an already-finished thread is a no-op, not a re-run
+    assert sdk.resume(graph, r.activity_id, "approved").status == "completed"
+
+
+# ── run() convenience with an injected (non-interactive) decision provider ──────
+
+def test_run_convenience_drives_pauses_and_ids_are_unique():
+    sdk = _sdk("auto")
+    graph = sdk.compile(_two_node_graph(), reviews=["node_a", "node_b"])
+    r1 = sdk.run(graph, {"a": "", "b": ""}, decide=lambda res: "approved")
+    r2 = sdk.run(graph, {"a": "", "b": ""}, decide=lambda res: "approved")
+    assert r1.status == "completed" and r2.status == "completed"
+    assert re.fullmatch(r"auto-\d{8}T\d{12}", r1.activity_id)   # unique timestamped id
+    assert r1.activity_id != r2.activity_id
+
+
+# ── Guardrail keyword fallback (no API key) ─────────────────────────────────────
 
 def test_guardrail_keyword_fallback_breach():
     from unistack._guardrail import evaluate_guardrail
-
-    # No api_key → keyword scan.
     result = evaluate_guardrail("No illegal activity", "This order is sanctioned and illegal")
     assert result["passed"] is False
     assert "sanctioned" in result["reason"] or "illegal" in result["reason"]
-
     clean = evaluate_guardrail("No illegal activity", "Standard retail order, low risk")
     assert clean["passed"] is True
-
-
-# ── Test 6: two sequential guards, both breach, both approved ─────────────────
-
-def test_two_sequential_guards_both_approved(clean_db):
-    sdk = _sdk("grd-two")
-    activity_id = "grd-two-two-1"
-
-    class S(TypedDict):
-        a: str
-        b: str
-
-    call_log = []
-
-    def mock_eval(policy, output, context=None, **kwargs):
-        call_log.append(output)
-        return {"passed": False, "reason": "test breach"}
-
-    def node_a(state):
-        return {"a": "output-a", "b": ""}
-
-    def node_b(state):
-        return {"b": "output-b"}
-
-    builder = StateGraph(S)
-    builder.add_node("node_a", node_a)
-    builder.add_node("node_b", node_b)
-    builder.add_edge(START, "node_a")
-    builder.add_edge("node_a", "node_b")
-    builder.add_edge("node_b", END)
-    graph = sdk.compile(builder, guards={"node_a": "Policy A", "node_b": "Policy B"})
-
-    _resolve(activity_id, "approved", times=2)
-
-    with patch(EVAL_TARGET, side_effect=mock_eval):
-        result = sdk.run(graph, {"a": "", "b": ""}, run_id="two-1")
-
-    assert result.status == "completed"
-    assert len(call_log) == 2, (
-        f"evaluate called {len(call_log)}x — expected exactly 2 (once per node)."
-    )
-
-
-# ── Test 7: run_id defaults to a unique timestamp ─────────────────────────────
-
-def test_run_id_defaults_to_unique_timestamp(clean_db):
-    import re
-
-    sdk = _sdk("auto")
-
-    class S(TypedDict):
-        value: str
-
-    def work(state):
-        return {"value": "safe"}
-
-    builder = StateGraph(S)
-    builder.add_node("work", work)
-    builder.add_edge(START, "work")
-    builder.add_edge("work", END)
-    graph = sdk.compile(builder)   # no guards/reviews → runs straight to END
-
-    r1 = sdk.run(graph, {"value": ""})   # no run_id → timestamp default
-    r2 = sdk.run(graph, {"value": ""})
-
-    # Human-readable {workflow}-{YYYYMMDD}T{HHMMSS+microseconds}, never UUID; unique per run.
-    assert re.fullmatch(r"auto-\d{8}T\d{12}", r1.activity_id), r1.activity_id
-    assert re.fullmatch(r"auto-\d{8}T\d{12}", r2.activity_id), r2.activity_id
-    assert r1.activity_id != r2.activity_id
