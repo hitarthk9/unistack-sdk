@@ -63,6 +63,10 @@ UNISTACK_API_TOKEN=<secret> unistack serve my_app.graph:builder --workflow conte
 # POST /activities  ·  POST /activities/{id}/resolve   (Authorization: Bearer <secret>)
 ```
 
+Long policy text doesn't have to live on the command line — declare a plain `UNISTACK_CONFIG`
+dict next to `builder` (still zero `unistack` import) and the deploy command collapses to
+`unistack serve my_app.graph:builder`, no flags. See [CLAUDE.md](CLAUDE.md) for the convention.
+
 - **Guard** — after the node runs, an LLM judges its output against the policy. Pass → continue;
   breach → a HITL pause. **Fail-closed**: if the judge itself errors, the output pauses for a
   human instead of slipping through.

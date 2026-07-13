@@ -121,6 +121,28 @@ UNISTACK_API_TOKEN=<secret> unistack serve my_app.graph:builder --workflow conte
   --guard "generate=No unverified claims." --review publish --context "Brand voice: …"
 ```
 
+**`UNISTACK_CONFIG` — governance as data, collocated with the graph.** Passing policy text
+(especially `context`, which can be long) as shell arguments on every deploy is awkward, and it
+puts the policy somewhere the graph's author doesn't see it. Instead, the author's module can
+declare a plain dict next to `builder`:
+
+```python
+# my_app/graph.py — still zero `unistack` import; this is just data.
+UNISTACK_CONFIG = {
+    "workflow": "content",
+    "guards": {"generate": "No unverified claims."},
+    "reviews": ["publish"],
+    "context": "Brand voice: professional, no unverified claims.",
+}
+```
+
+`unistack serve` auto-discovers a sibling `UNISTACK_CONFIG` in the same module as `builder` (by
+name — absent is fine, fully backward compatible). With it present, the deploy command collapses
+to `unistack serve my_app.graph:builder` — no flags. CLI flags still work and **merge on top**:
+`--guard`/`--review` add to (CLI wins per-key on `--guard` collisions) the config's sets;
+`--context`/`--workflow` override outright if passed. Useful for a one-off ops override without a
+redeploy, without making the common case carry the whole policy on the command line.
+
 Install with the server extra: `pip install "unistack[server]"` (adds fastapi + uvicorn).
 **Auth:** with `--token` / `UNISTACK_API_TOKEN` set, both POST endpoints require
 `Authorization: Bearer <token>` (401 otherwise); serving without one prints a loud warning —
@@ -159,8 +181,9 @@ unistack/
                      claims, hitl_pause spans
   _guardrail.py    ← evaluate_guardrail() via Claude tool-use (keyword-scan fallback; fail-closed)
   server.py        ← create_app(sdk, graph, token): the focused graph-runtime (FastAPI, bearer auth)
-  cli.py           ← `unistack serve module:builder … --token …`
-pyproject.toml  requirements.txt  README.md  tests/test_guardrail.py  tests/test_server.py
+  cli.py           ← `unistack serve module:builder …`; discovers a sibling UNISTACK_CONFIG
+pyproject.toml  requirements.txt  README.md
+tests/test_guardrail.py  tests/test_server.py  tests/test_cli.py
 ```
 
 ## MongoDB — what this writes (and cleans up)
