@@ -16,7 +16,7 @@ from pymongo import MongoClient
 
 import pytest
 
-from unistack import UniStack
+from unistack import UniStack, UniStackError
 
 MONGO_URI = "mongodb://localhost:27017"
 TEST_DB = "unistack_test"
@@ -34,7 +34,7 @@ def clean_db():
 
 
 def _wipe(db):
-    for c in ("checkpoints", "checkpoint_writes"):
+    for c in ("checkpoints", "checkpoint_writes", "hitl_resolutions"):
         db[c].drop()
 
 
@@ -179,7 +179,8 @@ def test_run_convenience_drives_pauses_and_ids_are_unique():
     r1 = sdk.run(graph, {"a": "", "b": ""}, decide=lambda res: "approved")
     r2 = sdk.run(graph, {"a": "", "b": ""}, decide=lambda res: "approved")
     assert r1.status == "completed" and r2.status == "completed"
-    assert re.fullmatch(r"auto-\d{8}T\d{12}", r1.activity_id)   # unique timestamped id
+    # unique timestamped id + 4-hex anti-collision suffix
+    assert re.fullmatch(r"auto-\d{8}T\d{12}-[0-9a-f]{4}", r1.activity_id)
     assert r1.activity_id != r2.activity_id
 
 
@@ -266,3 +267,195 @@ def test_guardrail_keyword_fallback_breach():
     assert "sanctioned" in result["reason"] or "illegal" in result["reason"]
     clean = evaluate_guardrail("No illegal activity", "Standard retail order, low risk")
     assert clean["passed"] is True
+
+
+# ── Judge failure fails CLOSED (never crash, never silently pass) ───────────────
+
+def test_judge_api_error_fails_closed():
+    from unistack._guardrail import evaluate_guardrail
+    with patch("anthropic.Anthropic") as anthro:
+        anthro.return_value.messages.create.side_effect = RuntimeError("api down")
+        with patch("langsmith.wrappers.wrap_anthropic", side_effect=lambda c, **k: c):
+            result = evaluate_guardrail("policy", "output", api_key="sk-ant-fake")
+    assert result["passed"] is False
+    assert "judge unavailable" in result["reason"]
+
+
+def test_judge_malformed_verdict_fails_closed():
+    from unittest.mock import MagicMock
+
+    from unistack._guardrail import evaluate_guardrail
+
+    block = MagicMock()
+    block.type = "tool_use"
+    block.input = {"pass": True}                 # wrong key — malformed verdict
+    resp = MagicMock()
+    resp.content = [block]
+    with patch("anthropic.Anthropic") as anthro:
+        anthro.return_value.messages.create.return_value = resp
+        with patch("langsmith.wrappers.wrap_anthropic", side_effect=lambda c, **k: c):
+            result = evaluate_guardrail("policy", "output", api_key="sk-ant-fake")
+    assert result["passed"] is False
+    assert "malformed verdict" in result["reason"]
+
+
+def test_sdk_pauses_when_judge_raises():
+    """Even if the whole evaluator blows up, the activity pauses instead of crashing."""
+    sdk = _sdk("grd-jerr")
+    graph = sdk.compile(_one_node_graph("gen"), guards={"gen": "policy"})
+    with patch(EVAL_TARGET, side_effect=RuntimeError("total judge failure")):
+        r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "paused" and r.node == "gen"
+    assert "judge error" in r.message
+
+
+def test_sdk_pauses_on_malformed_verdict_shape():
+    sdk = _sdk("grd-jshape")
+    graph = sdk.compile(_one_node_graph("gen"), guards={"gen": "policy"})
+    with patch(EVAL_TARGET, return_value={"verdict": "fine"}):     # missing "passed"
+        r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "paused"
+    assert "malformed guardrail verdict" in r.message
+
+
+# ── Dynamic interrupt() is rejected loudly (was: infinite loop) ─────────────────
+
+def test_dynamic_interrupt_raises_clear_error(clean_db):
+    from langgraph.types import interrupt
+
+    def needs_input(state):
+        answer = interrupt("what now?")
+        return {"a": answer, "b": ""}
+
+    b = StateGraph(S)
+    b.add_node("needs_input", needs_input)
+    b.add_edge(START, "needs_input")
+    b.add_edge("needs_input", END)
+
+    sdk = _sdk("dyn")
+    graph = sdk.compile(b)                       # no guards/reviews of our own
+    with pytest.raises(UniStackError, match="dynamic interrupt"):
+        sdk.start(graph, {"a": "", "b": ""})
+    # the dead thread's checkpoints were cleaned up
+    assert clean_db.checkpoints.count_documents({}) == 0
+
+
+# ── Parallel fan-out: every guarded node in a super-step is judged ──────────────
+
+class S3(TypedDict):
+    a: str
+    b: str
+    done: str
+
+
+def _fanout_graph():
+    def pa(state):
+        return {"a": "out-a"}
+
+    def pb(state):
+        return {"b": "out-b"}
+
+    def join(state):
+        return {"done": "yes"}
+
+    b = StateGraph(S3)
+    b.add_node("pa", pa)
+    b.add_node("pb", pb)
+    b.add_node("join", join)
+    b.add_edge(START, "pa")
+    b.add_edge(START, "pb")
+    b.add_edge("pa", "join")
+    b.add_edge("pb", "join")
+    b.add_edge("join", END)
+    return b
+
+
+def test_fanout_all_guarded_nodes_judged_pass():
+    sdk = _sdk("fan-pass")
+    graph = sdk.compile(_fanout_graph(), guards={"pa": "A", "pb": "B"})
+    with patch(EVAL_TARGET, side_effect=_passes) as mock:
+        r = sdk.start(graph, {"a": "", "b": "", "done": ""})
+    assert r.status == "completed"
+    assert mock.call_count == 2                  # BOTH parallel nodes judged
+    assert r.state["done"] == "yes"
+
+
+def test_fanout_breach_in_parallel_node_pauses_then_completes():
+    sdk = _sdk("fan-breach")
+    graph = sdk.compile(_fanout_graph(), guards={"pa": "A", "pb": "B"})
+    with patch(EVAL_TARGET, side_effect=_breaches) as mock:
+        r = sdk.start(graph, {"a": "", "b": "", "done": ""})
+    assert r.status == "paused"
+    assert mock.call_count == 2
+    assert "'pa'" in r.message and "'pb'" in r.message   # both breaches reported
+    r2 = sdk.resume(graph, r.activity_id, "approved")
+    assert r2.status == "completed" and r2.state["done"] == "yes"
+
+
+# ── Resolution claims: the double-approve race + unknown ids ────────────────────
+
+def test_concurrent_resolve_loses_claim_and_does_not_advance(clean_db):
+    sdk = _sdk("race")
+    graph = sdk.compile(_two_node_graph(), reviews=["node_a"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "paused"
+    # simulate another process winning the claim first
+    claimed = clean_db.hitl_resolutions.update_one(
+        {"activity_id": r.activity_id, "status": "pending"},
+        {"$set": {"status": "resolved", "decision": "approved", "resolved_by": "other-proc"}})
+    assert claimed.modified_count == 1
+    r2 = sdk.resume(graph, r.activity_id, "approved")
+    assert "already resolved" in r2.message
+    assert r2.state.get("b", "") == ""           # downstream node_b did NOT run again
+    assert _checkpoints(clean_db, r.activity_id) > 0   # thread untouched by the loser
+
+
+def test_resolve_claims_even_without_pending_record(clean_db):
+    """Crash-recovery: pending record missing → the resolve's insert IS the claim."""
+    sdk = _sdk("orphan")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    clean_db.hitl_resolutions.delete_many({"activity_id": r.activity_id})
+    r2 = sdk.resume(graph, r.activity_id, "approved")
+    assert r2.status == "completed"
+
+
+def test_resume_unknown_activity_is_not_found():
+    sdk = _sdk("nf")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.resume(graph, "nf-19990101T000000000000-dead", "approved")
+    assert r.status == "not_found"
+
+
+def test_resume_invalid_decision_raises():
+    sdk = _sdk("baddec")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    with pytest.raises(ValueError, match="decision"):
+        sdk.resume(graph, "whatever", "maybe")
+
+
+# ── run_id: same-microsecond starts never collide; SDK never touches os.environ ─
+
+def test_same_microsecond_starts_get_distinct_ids():
+    from datetime import datetime as real_datetime
+    from unittest.mock import MagicMock
+
+    frozen = MagicMock(wraps=real_datetime)
+    frozen.now.return_value = real_datetime(2026, 7, 13, 12, 0, 0, 123456)
+    sdk = _sdk("frozen")
+    graph = sdk.compile(_one_node_graph("gen"))
+    with patch("unistack.core.datetime", frozen):
+        r1 = sdk.start(graph, {"a": "", "b": ""})
+        r2 = sdk.start(graph, {"a": "", "b": ""})
+    assert r1.activity_id != r2.activity_id      # hex suffix differs despite equal timestamp
+    assert r1.activity_id.startswith("frozen-20260713T120000123456-")
+
+
+def test_init_never_mutates_environ():
+    import os
+    before = {k: os.environ.get(k) for k in
+              ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT")}
+    UniStack.init(workflow="envtest", mongo_uri=MONGO_URI, db_name=TEST_DB,
+                  langsmith_api_key="lsv2_pt_fake_key_for_test")
+    after = {k: os.environ.get(k) for k in before}
+    assert before == after

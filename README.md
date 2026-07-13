@@ -58,19 +58,22 @@ r = sdk.resume(graph, r.activity_id, "approved")    # continue; may pause again 
 …or just serve the graph as a durable runtime — no boilerplate:
 
 ```bash
-unistack serve my_app.graph:builder --workflow content \
+UNISTACK_API_TOKEN=<secret> unistack serve my_app.graph:builder --workflow content \
   --guard "generate=No unverified claims." --review publish
-# POST /activities  ·  POST /activities/{id}/resolve
+# POST /activities  ·  POST /activities/{id}/resolve   (Authorization: Bearer <secret>)
 ```
 
 - **Guard** — after the node runs, an LLM judges its output against the policy. Pass → continue;
-  breach → a HITL pause.
+  breach → a HITL pause. **Fail-closed**: if the judge itself errors, the output pauses for a
+  human instead of slipping through.
 - **Review** — an unconditional human sign-off after the node.
 - **Durable** — graph state is persisted by a MongoDB checkpointer; a paused activity survives a
-  restart and can be resumed by any process. No blocking, no Mongo queue.
+  restart and can be resumed by any process. Each pause is resolved **exactly once** (atomic
+  claim), so concurrent approvals can't double-advance a graph — safe to run multiple replicas.
 - **LangSmith** — each activity is one **thread** keyed by `activity_id`; an open `hitl_pause`
   span is a pending approval and the closed one is the audit. Listing pending / fetching a thread
-  reads straight from LangSmith (no SDK). Omit the key and tracing stays off.
+  reads straight from LangSmith (no SDK). Omit the key and tracing stays off. Tracing is
+  instance-scoped — the SDK never reads or writes environment variables.
 
 See [CLAUDE.md](CLAUDE.md) for the full reference (start/resume, the runtime, LangSmith index,
 hard constraints).

@@ -4,11 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unistack"
-version = "0.1.0"
+version = "0.2.0"
 description = "Guardrails + human-in-the-loop for existing LangGraph agents"
+readme = "README.md"
 requires-python = ">=3.10"
+# TODO: choose a license before publishing, e.g. license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+# langgraph is a RANGE, not a pin: the SDK latches onto the consumer's existing
+# LangGraph agent, so it must install alongside whatever 1.x they already run.
 dependencies = [
-    "langgraph==1.2.6",
+    "langgraph>=1.2,<2.0",
     "langgraph-checkpoint-mongodb>=0.4",
     "pymongo>=4.16.0",
     "anthropic>=0.40.0",

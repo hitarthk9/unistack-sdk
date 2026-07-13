@@ -9,7 +9,9 @@ breakpoints **and a durable checkpointer**, then drives the pauses.
 
 HITL is **durable and non-blocking**: graph state is persisted, so an activity can pause for a
 human and be resumed later — in a different process, after a restart. There is no in-memory
-blocking and no Mongo queue. Standalone pip-installable package; no dependency on other repos.
+blocking and no Mongo queue; a tiny `hitl_resolutions` collection acts as the per-pause
+resolution **lock + audit stub** (exactly one resolver wins a pause). Standalone
+pip-installable package; no dependency on other repos.
 
 ## The whole integration (unchanged for the author)
 
@@ -35,16 +37,21 @@ r = sdk.resume(graph, r.activity_id, "approved")     # continue; may pause again
 ```
 
 Your nodes are plain functions — UniStack never asks you to import it inside them. **All config
-is passed explicitly** — the SDK reads no environment variables and loads no `.env`.
+is passed explicitly** — the SDK reads no environment variables, writes none, and loads no `.env`.
 
 ## Concepts
 
 - **Guard** — `guards={node: policy}`. After the node runs, an LLM judges its output against the
   policy (+ `context`). Passed → continue silently. Breached → a HITL pause.
+  **Fail-closed:** if the judge itself fails (API error, malformed verdict), the output is
+  treated as a breach → HITL pause with "judge unavailable". A degraded judge never silently
+  passes output, and never crashes the activity.
 - **Review** — `reviews=[node]`. Unconditional human sign-off after the node. Always pauses.
 
 Both are LangGraph **static breakpoints** (`interrupt_after`). The author's graph topology is
-never modified.
+never modified. In a parallel fan-out, **every** guarded node of the super-step is judged (a
+breach in any of them pauses; the message lists all breaches). Dynamic `interrupt()` inside a
+node is **not supported** — the SDK detects it and raises `UniStackError` instead of hanging.
 
 ## Public API
 
@@ -52,12 +59,14 @@ never modified.
 sdk   = UniStack.init(...)                                  # see parameters below
 graph = sdk.compile(builder, guards={"n": "policy"}, reviews=["m"])
 
-r = sdk.start(graph, initial_state, run_id=None)           # non-blocking; run_id → unique ts
+r = sdk.start(graph, initial_state, run_id=None)           # non-blocking; run_id → unique ts+hex
 r = sdk.resume(graph, activity_id, decision, resolved_by=None)   # "approved" | "rejected"
 r = sdk.run(graph, initial_state, decide=None)             # local convenience over start/resume
 sdk.evaluate("policy", output_str)                         # {"passed", "reason"} — raw guard check
+sdk.close()                                                # or use `with UniStack.init(...) as sdk:`
 
-# RunResult: .activity_id  .status ("completed"|"paused"|"hitl_rejected"|"failed")  .node  .message
+# RunResult (dataclass): .activity_id  .state  .node  .message
+#   .status: "completed" | "paused" | "hitl_rejected" | "not_found" | "failed"
 ```
 
 ### `UniStack.init()` parameters
@@ -65,8 +74,8 @@ sdk.evaluate("policy", output_str)                         # {"passed", "reason"
 | Param | Required | Purpose |
 |---|---|---|
 | `workflow` | Yes | Workflow name; prefix of the activity id `{workflow}-{run_id}`, and the LangSmith project default |
-| `mongo_uri` | Yes | MongoDB — backs the **durable checkpointer** (graph state) |
-| `anthropic_api_key` | No | LLM guardrail judge; keyword-scan fallback when omitted |
+| `mongo_uri` | Yes | MongoDB — backs the **durable checkpointer** (graph state) + `hitl_resolutions` |
+| `anthropic_api_key` | No | LLM guardrail judge; keyword-scan fallback when omitted. Judge failures fail **closed** → HITL pause |
 | `langsmith_api_key` | No | Enables tracing **and the HITL pending-index / audit** (see below) |
 | `langsmith_project` | No | LangSmith project; defaults to `workflow` |
 | `context` | No | Business-domain text for the guardrail judge |
@@ -78,14 +87,18 @@ sdk.evaluate("policy", output_str)                         # {"passed", "reason"
 
 ```
 start(graph, initial_state):
-  advance: stream segments; a reached GUARD is judged inline (pass → keep going).
-  pause at a guard breach or a review node → open a hitl_pause span → return status "paused".
+  advance: stream segments; every reached GUARD in the segment is judged inline (pass → keep going).
+  pause at a guard breach or a review node → record a pending resolution + open a hitl_pause span
+  → return status "paused".
   reach END → return "completed".
 
 resume(graph, activity_id, decision):     # triggered by the human's decision, in any process
   load the persisted checkpoint (thread_id = activity_id).
+  CLAIM the pause's resolution atomically in hitl_resolutions — exactly one resolver wins;
+  a concurrent/repeated resolve is a recorded no-op, never a second advance.
   close the hitl_pause span (records decision + duration).
   reject → "hitl_rejected".  approve → advance to the next pause or END.
+  unknown activity_id → "not_found";  already-finalized activity → "completed" (no-op).
 ```
 
 Resuming a static breakpoint uses `graph.invoke(None, config)` (not `Command(resume=…)`, which is
@@ -93,10 +106,10 @@ for dynamic `interrupt()`). Because state is durable, `start` and `resume` can b
 requests, processes, or a process that restarted in between.
 
 **Idempotency / terminal pauses:** a static breakpoint on a *terminal* node leaves
-`get_state().next` empty — indistinguishable from a completed graph. So `resume` checks the
-decision first (reject always halts), and treats "approve with nothing left to run" as a harmless
-completed no-op. Concurrent double-*approve* of the *same* non-terminal pause within LangSmith's
-ingestion window is a known small race (mitigate in the UI); a lock is a future hardening.
+`get_state().next` empty — indistinguishable from a completed graph. So `resume` claims first,
+checks the decision (reject always halts), and treats "approve with nothing left to run" as a
+harmless completed no-op. The old double-approve race is closed by the claim: the loser gets a
+"pause already resolved" no-op result and never advances the graph.
 
 ## Deployment — `unistack serve`
 
@@ -104,13 +117,18 @@ The focused **graph-runtime** is the only component that imports the graph + SDK
 `POST /activities` (start) and `POST /activities/{id}/resolve` (resume), nothing else:
 
 ```bash
-unistack serve my_app.graph:builder --workflow content \
+UNISTACK_API_TOKEN=<secret> unistack serve my_app.graph:builder --workflow content \
   --guard "generate=No unverified claims." --review publish --context "Brand voice: …"
 ```
 
 Install with the server extra: `pip install "unistack[server]"` (adds fastapi + uvicorn).
-Everything read-only (listing pending approvals, fetching a thread) is **not** here — it comes
-from LangSmith (see below). Self-host anywhere (Azure Container Apps, etc.) with a managed Mongo.
+**Auth:** with `--token` / `UNISTACK_API_TOKEN` set, both POST endpoints require
+`Authorization: Bearer <token>` (401 otherwise); serving without one prints a loud warning —
+an open runtime lets anyone who can reach the port start and approve activities. `/health`
+stays open. Everything read-only (listing pending approvals, fetching a thread) is **not**
+here — it comes from LangSmith (see below). Self-host anywhere (Azure Container Apps, etc.)
+with a managed Mongo. **Scaling:** state is durable and pause resolution is claim-based, so
+multiple uvicorn workers / replicas behind a load balancer are safe.
 
 ## LangSmith — tracing + the HITL index
 
@@ -136,19 +154,24 @@ it — only discovery does; if LangSmith blips, nothing is lost (the checkpointe
 
 ```
 unistack/
-  __init__.py      ← exports UniStack, RunResult
-  core.py          ← UniStack: init, compile, start, resume, run, guard eval, hitl_pause spans
-  _guardrail.py    ← evaluate_guardrail() via Claude (keyword-scan fallback)
-  server.py        ← create_app(sdk, graph): the focused graph-runtime (FastAPI)
-  cli.py           ← `unistack serve module:builder …`
-pyproject.toml  requirements.txt  README.md  tests/test_guardrail.py
+  __init__.py      ← exports UniStack, RunResult, UniStackError; NullHandler on the logger
+  core.py          ← UniStack: init, compile, start, resume, run, guard eval, resolution
+                     claims, hitl_pause spans
+  _guardrail.py    ← evaluate_guardrail() via Claude tool-use (keyword-scan fallback; fail-closed)
+  server.py        ← create_app(sdk, graph, token): the focused graph-runtime (FastAPI, bearer auth)
+  cli.py           ← `unistack serve module:builder … --token …`
+pyproject.toml  requirements.txt  README.md  tests/test_guardrail.py  tests/test_server.py
 ```
 
 ## MongoDB — what this writes (and cleans up)
 
-Database `unistack` (configurable). The SDK writes only the **durable checkpointer** collections
-(`checkpoints`, `checkpoint_writes`) — LangGraph's persisted graph state. There is **no**
-`hitl_queue`; the pending list + audit live in LangSmith.
+Database `unistack` (configurable). The SDK writes the **durable checkpointer** collections
+(`checkpoints`, `checkpoint_writes`) — LangGraph's persisted graph state — plus
+**`hitl_resolutions`**: one tiny doc per pause, unique on `(activity_id, checkpoint_id)`.
+It is the per-pause resolution **lock** (exactly one resolver wins; duplicates become no-ops)
+and the disambiguation record (resolving an unknown id → `not_found`, a finalized one →
+completed no-op). It is **not** a queue — the pending list + audit still live in LangSmith.
+Resolution docs are kept after an activity terminates (bounded: one per pause).
 
 **Retention.** The moment an activity reaches a terminal outcome (completed or rejected), its
 thread is deleted via `MongoDBSaver.delete_thread(activity_id)` — nothing will ever resume from it
@@ -168,9 +191,17 @@ Notes:
 
 ## Environment variables
 
-**None read.** All config is constructor params. The only env vars the SDK *writes* are the
-`LANGSMITH_*` trio, and only when `langsmith_api_key` is passed. (The `unistack serve` CLI, acting
-as the consuming app, reads `MONGO_URI` / `ANTHROPIC_API_KEY` / `LANGSMITH_*` and passes them in.)
+**None read, none written.** All config is constructor params; LangSmith tracing is
+instance-scoped (an explicit `Client` + `LangChainTracer` in the graph config — no
+`LANGSMITH_*` globals). The `unistack serve` CLI, acting as the consuming app, reads
+`MONGO_URI` / `ANTHROPIC_API_KEY` / `LANGSMITH_*` / `UNISTACK_API_TOKEN` and passes them in.
+
+## Logging
+
+The SDK never prints — it logs through `logging.getLogger("unistack")` (with a `NullHandler`
+by default, per library convention). Consuming apps opt in, e.g.
+`logging.basicConfig(level=logging.INFO)`. The only exception is `run()`'s interactive
+terminal prompt, which is deliberately stdin/stdout.
 
 ## Install & test
 
@@ -183,12 +214,22 @@ PYTHONPATH=. venv/bin/python -m pytest tests/ -v   # needs MongoDB on localhost:
 ## Hard constraints
 
 1. Never modify the author's graph topology — guards/reviews are static breakpoints only.
-2. Activity IDs are human-readable: `{workflow}-{run_id}`, `run_id` a UTC microsecond timestamp
-   by default. Never UUID.
+   Dynamic `interrupt()` in a node is unsupported: detect it and raise `UniStackError`,
+   never loop.
+2. Activity IDs are human-readable: `{workflow}-{run_id}`, `run_id` defaulting to a UTC
+   microsecond timestamp plus a 4-hex-char suffix (collision-proof across replicas).
+   Never UUID.
 3. A HITL pause is not an error — `status="paused"` is normal, never `failed`.
-4. Guardrails use LLM evaluation — policy enforcement, not deterministic computation.
+4. Guardrails use LLM evaluation — policy enforcement, not deterministic computation. The
+   judge **fails closed**: an unavailable/unparseable judge is a breach (→ pause), never a
+   silent pass, never a crash.
 5. On rejection, the activity is abandoned (not resumed).
 6. State lives in the durable checkpointer; LangSmith is discovery/audit only. Resume must never
    depend on LangSmith being reachable.
 7. A terminal activity's checkpoints are deleted (best-effort); read final state BEFORE deleting.
    Cleanup failures must never change the returned status/state.
+8. A pause is resolved exactly once: `resume` must win the `hitl_resolutions` claim before
+   advancing; losers return a no-op, unknown ids return `not_found`.
+9. The SDK reads no environment variables and writes none; tracing is instance-scoped.
+10. `langgraph` stays a version RANGE (`>=1.2,<2.0`), never a pin — the SDK must install
+    alongside whatever LangGraph the consumer's agent already uses.

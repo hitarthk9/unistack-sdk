@@ -3,8 +3,8 @@
 hand-written init/compile boilerplate. Mirrors how `langgraph` serves a graph.
 
 The CLI is the consuming app here: it reads its own environment (MONGO_URI,
-ANTHROPIC_API_KEY, LANGSMITH_API_KEY, LANGSMITH_PROJECT) and passes the values
-explicitly into UniStack — the SDK itself still reads no environment.
+ANTHROPIC_API_KEY, LANGSMITH_API_KEY, LANGSMITH_PROJECT, UNISTACK_API_TOKEN) and
+passes the values explicitly into UniStack — the SDK itself still reads no environment.
 """
 
 import argparse
@@ -40,9 +40,14 @@ def _serve(args) -> None:
         context=args.context,
     )
     graph = sdk.compile(builder, guards=guards, reviews=reviews)
+    token = args.token or os.environ.get("UNISTACK_API_TOKEN") or None
+    if not token:
+        print("[UniStack] WARNING: serving WITHOUT authentication — anyone who can reach "
+              "this port can start and approve activities. Set --token or UNISTACK_API_TOKEN.")
     print(f"[UniStack] serving '{args.workflow}' from {args.builder} "
-          f"(guards={list(guards)}, reviews={reviews}) on {args.host}:{args.port}")
-    uvicorn.run(create_app(sdk, graph), host=args.host, port=args.port)
+          f"(guards={list(guards)}, reviews={reviews}, "
+          f"auth={'bearer token' if token else 'OFF'}) on {args.host}:{args.port}")
+    uvicorn.run(create_app(sdk, graph, token=token), host=args.host, port=args.port)
 
 
 def main() -> None:
@@ -57,6 +62,9 @@ def main() -> None:
     serve.add_argument("--review", action="append", metavar="NODE",
                        help="Require human sign-off after a node (repeatable)")
     serve.add_argument("--context", default=None, help="Business context for the guardrail judge")
+    serve.add_argument("--token", default=None,
+                       help="Bearer token required on the POST endpoints "
+                            "(default: UNISTACK_API_TOKEN env var; unset = no auth, with a warning)")
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
     serve.set_defaults(func=_serve)
