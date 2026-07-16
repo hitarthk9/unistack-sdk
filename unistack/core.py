@@ -16,9 +16,14 @@ checkpointer (MongoDB by default), so an activity can pause for a human and be
 resumed later — in a different process, after a restart. `start()` runs until a
 pause or END and returns; `resume()` (triggered by the human's decision) loads the
 persisted state and continues. The checkpointer is the state store; a small
-`hitl_resolutions` collection is the per-pause resolution lock + audit stub (exactly
-one resolver wins a pause — concurrent duplicates become no-ops); LangSmith is the
-pending-index + trace audit (an open `hitl_pause` span = a pending approval).
+`hitl_resolutions` collection is the per-pause resolution lock, the pending-approvals
+index (`status: "pending"`), and the audit record (exactly one resolver wins a pause —
+concurrent duplicates become no-ops).
+
+Tracing is pure OpenTelemetry (OTLP), instance-scoped: each start/resume leg is one
+trace, grouped per activity by `session.id`; the human wait is a `hitl_pause` span
+emitted retroactively at resolve time into the pausing leg's trace. Point it at any
+OTLP/HTTP backend (a collector, a hyperscaler agent, or Langfuse).
 
 All configuration is passed explicitly at init — the SDK reads no environment
 variables, writes no environment variables, and loads no .env file.
@@ -29,7 +34,8 @@ Usage::
     from my_app.graph import builder          # existing, untouched StateGraph
 
     sdk   = UniStack.init(workflow="content", mongo_uri="mongodb://localhost:27017",
-                          anthropic_api_key="sk-ant-...", langsmith_api_key="ls-...")
+                          anthropic_api_key="sk-ant-...",
+                          otel_endpoint="https://langfuse.internal/api/public/otel")
     graph = sdk.compile(builder, guards={"generate": "No unverified claims."},
                         reviews=["publish"])
 
@@ -44,7 +50,6 @@ Usage::
 import json
 import logging
 import secrets
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
@@ -53,16 +58,13 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
+from unistack._telemetry import Telemetry, _clip
+
 if TYPE_CHECKING:
     from langgraph.graph import StateGraph
     from langgraph.graph.state import CompiledStateGraph
 
 logger = logging.getLogger("unistack")
-
-# Fixed namespace so a pause span's LangSmith run id is deterministic from
-# (activity_id, checkpoint_id) — open and close address the exact same run with no
-# query (avoids ingestion-latency races when pauses resolve quickly).
-_PAUSE_NS = uuid.UUID("7b3f9c2a-1e5d-4a6b-8c0f-2d9e4a1b6c7e")
 
 _DECISIONS = ("approved", "rejected")
 
@@ -91,12 +93,14 @@ class UniStack:
         workflow: str,
         mongo_uri: str,
         anthropic_api_key: str | None = None,
-        langsmith_api_key: str | None = None,
-        langsmith_project: str | None = None,
+        otel_endpoint: str | None = None,
+        otel_headers: dict | str | None = None,
+        otel_service_name: str | None = None,
         context: str | None = None,
         db_name: str = "unistack",
         guardrail_model: str = "claude-haiku-4-5-20251001",
         checkpointer=None,
+        tracer_provider=None,
     ):
         self._workflow = workflow
         self._anthropic_api_key = anthropic_api_key
@@ -111,15 +115,13 @@ class UniStack:
         self._guards: dict[str, str] = {}   # node -> policy text
         self._reviews: set[str] = set()     # nodes needing unconditional sign-off
 
-        # LangSmith: traces + the HITL pending-index / audit. Enabled when a key is
-        # supplied; the SDK's own state/resume never depend on it — only discovery does.
-        # The client is instance-scoped: nothing is written to os.environ.
-        self._tracing = bool(langsmith_api_key)
-        self._project = (langsmith_project or workflow) if self._tracing else None
-        self._ls = None
-        if langsmith_api_key:
-            from langsmith import Client
-            self._ls = Client(api_key=langsmith_api_key)
+        # OpenTelemetry: pure-OTLP tracing, enabled by an endpoint or a caller-supplied
+        # provider. Instance-scoped — the provider is never installed globally and
+        # nothing is written to os.environ. The SDK's own state/resume never depend on
+        # the telemetry backend; every telemetry call is best-effort.
+        self._telemetry = Telemetry(workflow, tracer_provider=tracer_provider,
+                                    endpoint=otel_endpoint, headers=otel_headers,
+                                    service_name=otel_service_name)
 
     @classmethod
     def init(cls, *args, **kwargs) -> "UniStack":
@@ -133,10 +135,15 @@ class UniStack:
         return self._mongo
 
     def close(self) -> None:
-        """Close the SDK's own MongoDB connection (a custom checkpointer's client is untouched)."""
+        """
+        Close the SDK's own MongoDB connection (a custom checkpointer's client is
+        untouched) and flush + shut down the SDK-owned tracer provider so buffered
+        spans export. A caller-supplied `tracer_provider` is the caller's to close.
+        """
         if self._mongo is not None:
             self._mongo.close()
             self._mongo = None
+        self._telemetry.shutdown()
 
     def __enter__(self) -> "UniStack":
         return self
@@ -157,7 +164,7 @@ class UniStack:
         self._reviews = set(reviews or [])
         stops = list(self._guards) + [n for n in self._reviews if n not in self._guards]
         # Keep a handle on the checkpointer so a terminal activity can have its Mongo
-        # working-state deleted (see _delete_checkpoint). LangSmith traces are untouched.
+        # working-state deleted (see _delete_checkpoint). Exported traces are untouched.
         self._checkpointer = self._checkpointer or MongoDBSaver(self._client(), db_name=self._db_name)
         return builder.compile(checkpointer=self._checkpointer, interrupt_after=stops)
 
@@ -166,8 +173,9 @@ class UniStack:
     def start(self, graph, initial_state: dict, run_id: str | None = None) -> RunResult:
         """
         Begin an activity. Runs until the first human pause (guard breach / review) or
-        END, then RETURNS — never blocks. On a pause, records a pending resolution and
-        opens a `hitl_pause` span (the pending-approval marker), then returns "paused".
+        END, then RETURNS — never blocks. On a pause, records a pending resolution in
+        `hitl_resolutions` (the pending-approval marker, carrying this leg's trace ids),
+        then returns "paused".
 
         run_id defaults to a UTC microsecond timestamp plus a 4-hex-char suffix, so
         concurrent starts (e.g. on different replicas) can never share a thread.
@@ -176,7 +184,10 @@ class UniStack:
             f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{secrets.token_hex(2)}"
         )
         activity_id = f"{self._workflow}-{run_id}"
-        return self._drive(graph, initial_state, activity_id)
+        with self._telemetry.leg("start", activity_id) as span:
+            result = self._drive(graph, initial_state, activity_id)
+            self._telemetry.stamp_result(span, result)
+        return result
 
     def resume(self, graph, activity_id: str, decision: str,
                resolved_by: str | None = None) -> RunResult:
@@ -196,6 +207,15 @@ class UniStack:
         """
         if decision not in _DECISIONS:
             raise ValueError(f"decision must be one of {_DECISIONS}, got {decision!r}")
+        with self._telemetry.leg("resume", activity_id,
+                                 {"unistack.decision": decision,
+                                  "unistack.resolved_by": resolved_by or ""}) as span:
+            result = self._resume(graph, activity_id, decision, resolved_by)
+            self._telemetry.stamp_result(span, result)
+        return result
+
+    def _resume(self, graph, activity_id: str, decision: str,
+                resolved_by: str | None) -> RunResult:
         config = self._config(activity_id)
         snapshot = graph.get_state(config)
         checkpoint_id = snapshot.config.get("configurable", {}).get("checkpoint_id")
@@ -209,7 +229,8 @@ class UniStack:
             return RunResult(activity_id, {}, "not_found",
                              message=f"no such activity: '{activity_id}'")
 
-        if not self._claim_resolution(activity_id, checkpoint_id, decision, resolved_by):
+        claimed = self._claim_resolution(activity_id, checkpoint_id, decision, resolved_by)
+        if claimed is None:
             prior = self._resolutions().find_one(
                 {"activity_id": activity_id, "checkpoint_id": checkpoint_id}) or {}
             status = "paused" if snapshot.next else "completed"
@@ -218,7 +239,12 @@ class UniStack:
                 message=(f"pause already resolved ({prior.get('decision')} "
                          f"by {prior.get('resolved_by')}) — no-op"))
 
-        self._close_pause_span(activity_id, checkpoint_id, decision, resolved_by)
+        self._telemetry.add_event("resolution_claimed", {
+            "decision": decision, "resolved_by": resolved_by or "",
+            "checkpoint_id": checkpoint_id or ""})
+        self._emit_pause_span(claimed, decision, resolved_by)
+        if claimed.get("trace_id") and claimed.get("span_id"):
+            self._telemetry.link_current_to(claimed["trace_id"], claimed["span_id"])
         if decision != "approved":               # reject always halts the activity
             self._delete_checkpoint(activity_id)
             return RunResult(activity_id, dict(snapshot.values), "hitl_rejected")
@@ -290,15 +316,17 @@ class UniStack:
             snapshot = graph.get_state(config)
             checkpoint_id = snapshot.config.get("configurable", {}).get("checkpoint_id")
             logger.info("paused after '%s': %s", node, message)
-            self._record_pending(activity_id, checkpoint_id, node)
-            self._open_pause_span(activity_id, node, message, checkpoint_id)
+            self._record_pending(activity_id, checkpoint_id, node, message,
+                                 self._telemetry.current_ids())
+            self._telemetry.add_event("hitl_pause_opened",
+                                      {"node": node, "checkpoint_id": checkpoint_id or ""})
             return RunResult(activity_id, dict(snapshot.values), "paused", node, message)
 
     def _judge(self, node: str, output, activity_id: str) -> dict:
         """Judge one node's output. Never raises — a failing judge fails closed (breach)."""
         try:
             verdict = self.evaluate(self._guards[node], json.dumps(output, default=str),
-                                    thread_id=activity_id)
+                                    thread_id=activity_id, node=node)
         except Exception as exc:
             verdict = {"passed": False, "reason": f"guardrail judge error: {exc}"}
         if not isinstance(verdict, dict) or not isinstance(verdict.get("passed"), bool):
@@ -338,15 +366,17 @@ class UniStack:
             "metadata":     self._thread_meta(activity_id),
             "tags":         [activity_id, self._workflow],
         }
-        if self._ls:
-            # Instance-scoped tracing: an explicit tracer bound to this SDK's client —
-            # nothing global, no os.environ writes.
-            from langchain_core.tracers.langchain import LangChainTracer
-            config["callbacks"] = [LangChainTracer(client=self._ls, project_name=self._project)]
+        handler = self._telemetry.handler(activity_id)
+        if handler is not None:
+            # Instance-scoped tracing: an explicit OTel callback handler in the graph
+            # config — nothing global, no os.environ writes. Node-internal llm.invoke()
+            # calls inherit it via langchain-core's contextvar config propagation.
+            config["callbacks"] = [handler]
         return config
 
     def _thread_meta(self, activity_id: str) -> dict:
-        """Metadata that groups every run of an activity into one LangSmith thread."""
+        """Metadata stamped on every run of an activity (kept on the graph config for
+        consumers; the OTel spans carry the same ids as `session.id` attributes)."""
         return {"thread_id": activity_id, "activity_id": activity_id, "workflow": self._workflow}
 
     @staticmethod
@@ -358,7 +388,7 @@ class UniStack:
         Delete all Mongo checkpoint documents for a terminal activity (completed/rejected) —
         nothing will ever resume from this thread again. Uses the checkpointer's own
         delete_thread(); wrapped best-effort so a Mongo hiccup during cleanup can never
-        change the returned status/state. LangSmith's thread history is never touched.
+        change the returned status/state. Exported traces are never touched.
         """
         try:
             self._checkpointer.delete_thread(activity_id)
@@ -374,23 +404,31 @@ class UniStack:
             self._resolutions_indexed = True
         return coll
 
-    def _record_pending(self, activity_id: str, checkpoint_id: str | None, node: str) -> None:
-        """Record an open pause. Best-effort: resume() can claim even without this record."""
+    def _record_pending(self, activity_id: str, checkpoint_id: str | None, node: str,
+                        message: str | None, trace_ids: tuple[str, str] | None) -> None:
+        """
+        Record an open pause — this doc IS the pending-approvals index (status "pending")
+        and carries the pausing leg's trace ids so the `hitl_pause` span can later be
+        emitted into that trace. Best-effort: resume() can claim even without it.
+        """
+        trace_id, span_id = trace_ids or (None, None)
         try:
             self._resolutions().update_one(
                 {"activity_id": activity_id, "checkpoint_id": checkpoint_id},
-                {"$setOnInsert": {"status": "pending", "node": node,
+                {"$setOnInsert": {"status": "pending", "node": node, "message": message,
                                   "workflow": self._workflow,
+                                  "trace_id": trace_id, "span_id": span_id,
                                   "opened_at": datetime.now(timezone.utc)}},
                 upsert=True)
         except Exception as exc:
             logger.warning("could not record pending pause for %s: %s", activity_id, exc)
 
     def _claim_resolution(self, activity_id: str, checkpoint_id: str,
-                          decision: str, resolved_by: str | None) -> bool:
+                          decision: str, resolved_by: str | None) -> dict | None:
         """
         Atomically claim this pause's resolution — exactly one resolver wins. Returns
-        False when the pause was already resolved (a concurrent/repeated resolve).
+        the claimed pending doc (its pre-image: node, message, opened_at, trace ids),
+        or None when the pause was already resolved (a concurrent/repeated resolve).
         If the pending record is missing (a crash between checkpoint and record), the
         insert IS the claim; a duplicate-key error means someone else just won.
         """
@@ -401,69 +439,70 @@ class UniStack:
             {"activity_id": activity_id, "checkpoint_id": checkpoint_id, "status": "pending"},
             {"$set": fields})
         if won is not None:
-            return True
+            return won
         try:
-            coll.insert_one({"activity_id": activity_id, "checkpoint_id": checkpoint_id,
-                             "node": None, "workflow": self._workflow,
-                             "opened_at": fields["resolved_at"], **fields})
-            return True
+            doc = {"activity_id": activity_id, "checkpoint_id": checkpoint_id,
+                   "node": None, "workflow": self._workflow,
+                   "opened_at": fields["resolved_at"], **fields}
+            coll.insert_one(doc)
+            return doc          # crash-path claim: carries no trace ids / opened_at ≈ now
         except DuplicateKeyError:
-            return False
+            return None
 
     # ── Guardrail evaluation ──────────────────────────────────────────────────
 
-    def evaluate(self, policy: str, output: str, thread_id: str | None = None) -> dict:
+    def evaluate(self, policy: str, output: str, thread_id: str | None = None,
+                 node: str | None = None) -> dict:
         """
         Evaluate output against a policy using Claude (LLM-as-judge).
         Returns {"passed": bool, "reason": str}. Falls back to a keyword scan when no
         anthropic_api_key was supplied; fails closed (passed=False) if the judge errors.
-        When thread_id is given, the guardrail_eval trace joins that LangSmith thread.
+        Traced as a `guardrail_eval` span — nested in the running leg's trace when
+        called mid-run (thread_id = the activity id), a standalone trace otherwise.
         """
         from unistack._guardrail import evaluate_guardrail
-        if self._ls:
-            from langsmith import tracing_context
-            with tracing_context(enabled=True, client=self._ls, project_name=self._project,
-                                 metadata=self._thread_meta(thread_id) if thread_id else None):
-                return evaluate_guardrail(policy, output, self._guardrail_context,
-                                          api_key=self._anthropic_api_key,
-                                          model=self._guardrail_model)
-        return evaluate_guardrail(policy, output, self._guardrail_context,
-                                  api_key=self._anthropic_api_key, model=self._guardrail_model)
+        with self._telemetry.span("guardrail_eval", {
+                "unistack.guardrail.node": node,
+                "unistack.guardrail.policy": _clip(policy, 1000),
+                "unistack.guardrail.mode": "llm" if self._anthropic_api_key else "keyword",
+        }, activity_id=thread_id) as span:
+            verdict = evaluate_guardrail(policy, output, self._guardrail_context,
+                                         api_key=self._anthropic_api_key,
+                                         model=self._guardrail_model,
+                                         telemetry=self._telemetry)
+            self._telemetry.set_attrs(span, {
+                "unistack.guardrail.passed": verdict.get("passed"),
+                "unistack.guardrail.reason": verdict.get("reason")})
+        return verdict
 
-    # ── HITL pause span (LangSmith = pending index + audit) ─────────────────────
+    # ── HITL pause span (emitted retroactively — OTLP cannot export open spans) ──
 
-    def _span_id(self, activity_id: str, checkpoint_id: str | None) -> str:
-        return str(uuid.uuid5(_PAUSE_NS, f"{activity_id}:{checkpoint_id}"))
-
-    def _open_pause_span(self, activity_id, node, message, checkpoint_id) -> None:
-        """Open a `hitl_pause` run (posted, left un-ended). An open one = a pending approval."""
-        if not self._ls:
+    def _emit_pause_span(self, doc: dict, decision: str, resolved_by: str | None) -> None:
+        """
+        Emit the completed `hitl_pause` span into the pausing leg's trace: parent and
+        start time come from the pending doc persisted at pause time, the end is now —
+        so its duration is the real human wait, across processes and restarts. Called
+        only by the claim winner, so it is emitted exactly once. A doc without trace
+        ids (crash-path claim, or telemetry was off at pause time) is skipped.
+        """
+        if not self._telemetry.enabled:
             return
-        rid = self._span_id(activity_id, checkpoint_id)
-        start = datetime.now(timezone.utc)
-        try:
-            self._ls.create_run(
-                name="hitl_pause", run_type="tool",
-                inputs={"activity_id": activity_id, "node": node, "message": message},
-                id=rid, trace_id=rid, start_time=start,
-                dotted_order=f"{start.strftime('%Y%m%dT%H%M%S%f')}Z{rid}",
-                project_name=self._project, extra={"metadata": self._thread_meta(activity_id)},
-                tags=[activity_id, self._workflow],
-            )
-        except Exception as exc:                             # tracing is best-effort
-            logger.warning("could not open hitl_pause span for %s: %s", activity_id, exc)
-
-    def _close_pause_span(self, activity_id, checkpoint_id, decision, resolved_by) -> None:
-        """Close the `hitl_pause` run for this pause (its duration is the human wait)."""
-        if not self._ls:
+        trace_id, span_id, opened_at = doc.get("trace_id"), doc.get("span_id"), doc.get("opened_at")
+        if not (trace_id and span_id and opened_at):
+            logger.warning("no trace recorded for pause %s/%s — skipping hitl_pause span",
+                           doc.get("activity_id"), doc.get("checkpoint_id"))
             return
-        try:
-            self._ls.update_run(
-                self._span_id(activity_id, checkpoint_id), end_time=datetime.now(timezone.utc),
-                outputs={"decision": decision, "resolved_by": resolved_by},
-            )
-        except Exception as exc:
-            logger.warning("could not close hitl_pause span for %s: %s", activity_id, exc)
+        activity_id = doc.get("activity_id")
+        self._telemetry.emit_closed_span("hitl_pause", trace_id, span_id, opened_at, {
+            "session.id": activity_id,
+            "langfuse.session.id": activity_id,
+            "unistack.activity_id": activity_id,
+            "unistack.workflow": doc.get("workflow") or self._workflow,
+            "unistack.pause.node": doc.get("node"),
+            "unistack.pause.message": _clip(doc["message"], 1000) if doc.get("message") else None,
+            "unistack.decision": decision,
+            "unistack.resolved_by": resolved_by or "",
+        })
 
     # ── Local interactive decision (run() default) ─────────────────────────────
 

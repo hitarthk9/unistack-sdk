@@ -2,8 +2,9 @@
 Integration tests for UniStack guardrails + durable HITL (start / resume model).
 Requires MongoDB on localhost:27017 (uses isolated "unistack_test" database).
 
-Tracing is off in tests (no LangSmith key) so the hitl_pause span open/close are no-ops
-and nothing hits the network. start()/resume() are synchronous — no threads or polling.
+Tracing is off in tests here (no tracer_provider / otel_endpoint) so every telemetry
+call is a no-op and nothing hits the network; span behaviour is covered by
+tests/test_telemetry.py. start()/resume() are synchronous — no threads or polling.
 """
 
 import re
@@ -275,8 +276,7 @@ def test_judge_api_error_fails_closed():
     from unistack._guardrail import evaluate_guardrail
     with patch("anthropic.Anthropic") as anthro:
         anthro.return_value.messages.create.side_effect = RuntimeError("api down")
-        with patch("langsmith.wrappers.wrap_anthropic", side_effect=lambda c, **k: c):
-            result = evaluate_guardrail("policy", "output", api_key="sk-ant-fake")
+        result = evaluate_guardrail("policy", "output", api_key="sk-ant-fake")
     assert result["passed"] is False
     assert "judge unavailable" in result["reason"]
 
@@ -293,8 +293,7 @@ def test_judge_malformed_verdict_fails_closed():
     resp.content = [block]
     with patch("anthropic.Anthropic") as anthro:
         anthro.return_value.messages.create.return_value = resp
-        with patch("langsmith.wrappers.wrap_anthropic", side_effect=lambda c, **k: c):
-            result = evaluate_guardrail("policy", "output", api_key="sk-ant-fake")
+        result = evaluate_guardrail("policy", "output", api_key="sk-ant-fake")
     assert result["passed"] is False
     assert "malformed verdict" in result["reason"]
 
@@ -454,8 +453,10 @@ def test_same_microsecond_starts_get_distinct_ids():
 def test_init_never_mutates_environ():
     import os
     before = {k: os.environ.get(k) for k in
-              ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT")}
+              ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+               "OTEL_EXPORTER_OTLP_HEADERS", "OTEL_SERVICE_NAME")}
     UniStack.init(workflow="envtest", mongo_uri=MONGO_URI, db_name=TEST_DB,
-                  langsmith_api_key="lsv2_pt_fake_key_for_test")
+                  otel_endpoint="http://localhost:4318",
+                  otel_headers="Authorization=Basic fake")
     after = {k: os.environ.get(k) for k in before}
     assert before == after

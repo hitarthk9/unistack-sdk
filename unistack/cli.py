@@ -3,8 +3,9 @@
 hand-written init/compile boilerplate. Mirrors how `langgraph` serves a graph.
 
 The CLI is the consuming app here: it reads its own environment (MONGO_URI,
-ANTHROPIC_API_KEY, LANGSMITH_API_KEY, LANGSMITH_PROJECT, UNISTACK_API_TOKEN) and
-passes the values explicitly into UniStack — the SDK itself still reads no environment.
+ANTHROPIC_API_KEY, OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+OTEL_EXPORTER_OTLP_HEADERS, OTEL_SERVICE_NAME, UNISTACK_API_TOKEN) and passes the
+values explicitly into UniStack — the SDK itself still reads no environment.
 
 Governance (workflow / guards / reviews / context) can also be declared as plain data next
 to the builder — a module-level `UNISTACK_CONFIG` dict — so a deploy command doesn't need to
@@ -55,8 +56,11 @@ def _serve(args) -> None:
         workflow=workflow,
         mongo_uri=os.environ.get("MONGO_URI", "mongodb://localhost:27017"),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
-        langsmith_api_key=os.environ.get("LANGSMITH_API_KEY") or None,
-        langsmith_project=os.environ.get("LANGSMITH_PROJECT") or None,
+        # Standard OTel env vars; the signal-specific TRACES endpoint wins when both set.
+        otel_endpoint=(os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                       or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None),
+        otel_headers=os.environ.get("OTEL_EXPORTER_OTLP_HEADERS") or None,
+        otel_service_name=os.environ.get("OTEL_SERVICE_NAME") or f"unistack-{workflow}",
         context=context,
     )
     graph = sdk.compile(builder, guards=guards, reviews=reviews)
@@ -67,7 +71,10 @@ def _serve(args) -> None:
     print(f"[UniStack] serving '{workflow}' from {args.builder} "
           f"(guards={list(guards)}, reviews={reviews}, "
           f"auth={'bearer token' if token else 'OFF'}) on {args.host}:{args.port}")
-    uvicorn.run(create_app(sdk, graph, token=token), host=args.host, port=args.port)
+    try:
+        uvicorn.run(create_app(sdk, graph, token=token), host=args.host, port=args.port)
+    finally:
+        sdk.close()      # flush buffered spans (BatchSpanProcessor) on shutdown
 
 
 def main() -> None:

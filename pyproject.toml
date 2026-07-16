@@ -26,7 +26,8 @@ dependencies = [
     "langgraph-checkpoint-mongodb>=0.4",
     "pymongo>=4.16.0",
     "anthropic>=0.40.0",
-    "langsmith>=0.3",
+    "opentelemetry-sdk>=1.30,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
 ]
 
 [project.optional-dependencies]

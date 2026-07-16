@@ -32,7 +32,8 @@ sdk = UniStack.init(
     workflow="content",
     mongo_uri=os.environ["MONGO_URI"],
     anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),      # LLM guardrail judge
-    langsmith_api_key=os.environ.get("LANGSMITH_API_KEY"),      # optional: LangSmith tracing
+    otel_endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),  # optional: OTLP tracing
+    otel_headers=os.environ.get("OTEL_EXPORTER_OTLP_HEADERS"),    # e.g. Langfuse Basic auth
     context="Brand voice: professional. No unverified medical or financial claims.",
 )
 
@@ -74,10 +75,13 @@ dict next to `builder` (still zero `unistack` import) and the deploy command col
 - **Durable** — graph state is persisted by a MongoDB checkpointer; a paused activity survives a
   restart and can be resumed by any process. Each pause is resolved **exactly once** (atomic
   claim), so concurrent approvals can't double-advance a graph — safe to run multiple replicas.
-- **LangSmith** — each activity is one **thread** keyed by `activity_id`; an open `hitl_pause`
-  span is a pending approval and the closed one is the audit. Listing pending / fetching a thread
-  reads straight from LangSmith (no SDK). Omit the key and tracing stays off. Tracing is
-  instance-scoped — the SDK never reads or writes environment variables.
+- **OpenTelemetry** — pure OTLP tracing, wireable to self-hosted Langfuse, a collector, or any
+  hyperscaler backend. Each start/resume leg is one trace; every trace of an activity shares
+  `session.id = activity_id` (Langfuse groups them as a session). The human wait is a
+  `hitl_pause` span emitted at resolve time into the pausing leg's trace. Pending approvals are
+  listed from MongoDB (`hitl_resolutions`), not from the tracing backend. Omit the endpoint and
+  tracing stays off. Tracing is instance-scoped — the SDK never reads or writes environment
+  variables.
 
-See [CLAUDE.md](CLAUDE.md) for the full reference (start/resume, the runtime, LangSmith index,
+See [CLAUDE.md](CLAUDE.md) for the full reference (start/resume, the runtime, the span model,
 hard constraints).

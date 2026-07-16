@@ -3,8 +3,8 @@ Focused graph-runtime — the ONLY component that imports the graph + SDK.
 
 Its whole job is to start an activity and resume it on a human decision. State is
 durable (checkpointer), so start and resume can be different requests / processes.
-Everything read-only (listing pending approvals, fetching a thread) is NOT here — it
-comes from LangSmith directly.
+Everything read-only (listing pending approvals, fetching pause history) is NOT here —
+it comes from the `hitl_resolutions` Mongo collection (see unistack-api).
 
 Build it with `create_app(sdk, graph, token=...)` or run it with
 `unistack serve module:builder --token ...`. When a token is set, both POST

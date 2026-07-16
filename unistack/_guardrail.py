@@ -1,6 +1,6 @@
+import json
 import logging
-
-from langsmith import traceable
+from contextlib import nullcontext
 
 logger = logging.getLogger("unistack")
 
@@ -34,24 +34,23 @@ _SYSTEM = (
 )
 
 
-def _judge_trace_inputs(inputs: dict) -> dict:
-    """Log the judge's decision inputs to LangSmith — never the API key."""
-    return {k: inputs[k] for k in ("policy", "output", "context", "model") if k in inputs}
-
-
-@traceable(name="guardrail_eval", run_type="chain", process_inputs=_judge_trace_inputs)
 def evaluate_guardrail(
     policy: str,
     output: str,
     context: str | None = None,
     api_key: str | None = None,
     model: str = "claude-haiku-4-5-20251001",
+    telemetry=None,
 ) -> dict:
     """
     Returns {"passed": bool, "reason": str}.
     Uses Claude when api_key is supplied; falls back to a keyword scan otherwise.
     When context is provided, it is injected into the LLM prompt so the
     evaluator has workflow-specific business domain knowledge.
+
+    When a `Telemetry` instance is passed, the Claude call is traced as a GenAI chat
+    span (model + token usage + verdict) under the caller's `guardrail_eval` span.
+    Telemetry is best-effort — it can never change the verdict.
 
     Fail-closed: any judge failure (API error, malformed verdict) returns passed=False,
     so the caller pauses for a human — a degraded judge never silently waves output through.
@@ -67,28 +66,35 @@ def evaluate_guardrail(
 
     try:
         import anthropic
-        from langsmith.wrappers import wrap_anthropic
-        # wrap_anthropic traces the Claude call as a child LLM span with tokens + cost.
-        client = wrap_anthropic(anthropic.Anthropic(api_key=api_key))
+        client = anthropic.Anthropic(api_key=api_key)
         context_section = f"Business Context:\n{context}\n\n" if context else ""
-        resp = client.messages.create(
-            model=model,
-            max_tokens=300,
-            system=_SYSTEM,
-            tools=[_VERDICT_TOOL],
-            tool_choice={"type": "tool", "name": "verdict"},
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"{context_section}"
-                    f"Policy to enforce: {policy}\n\n"
-                    f"<output_to_evaluate>\n{output}\n</output_to_evaluate>"
-                ),
-            }],
+        prompt = (
+            f"{context_section}"
+            f"Policy to enforce: {policy}\n\n"
+            f"<output_to_evaluate>\n{output}\n</output_to_evaluate>"
         )
-        verdict = next(b for b in resp.content if b.type == "tool_use").input
-        if not isinstance(verdict.get("passed"), bool) or not isinstance(verdict.get("reason"), str):
-            raise ValueError(f"malformed verdict: {verdict!r}")
+        llm_cm = telemetry.llm_span(model, input_value=prompt) if telemetry is not None \
+            else nullcontext()
+        with llm_cm as llm_span:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=300,
+                system=_SYSTEM,
+                tools=[_VERDICT_TOOL],
+                tool_choice={"type": "tool", "name": "verdict"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+            verdict = next(b for b in resp.content if b.type == "tool_use").input
+            if not isinstance(verdict.get("passed"), bool) or not isinstance(verdict.get("reason"), str):
+                raise ValueError(f"malformed verdict: {verdict!r}")
+            if telemetry is not None:
+                usage = getattr(resp, "usage", None)
+                telemetry.set_attrs(llm_span, {
+                    "gen_ai.response.model": getattr(resp, "model", None) or model,
+                    "gen_ai.usage.input_tokens": getattr(usage, "input_tokens", None),
+                    "gen_ai.usage.output_tokens": getattr(usage, "output_tokens", None),
+                    "output.value": json.dumps(verdict, default=str),
+                })
         return {"passed": verdict["passed"], "reason": verdict["reason"]}
     except Exception as exc:                     # fail closed — a human decides instead
         logger.warning("guardrail judge unavailable (%s) — failing closed", exc)

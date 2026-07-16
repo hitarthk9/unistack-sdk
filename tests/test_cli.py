@@ -63,9 +63,13 @@ def _run_serve_argv(argv, monkeypatch, patch_uvicorn):
             captured["reviews"] = reviews
             return "compiled-graph"
 
+        def close(self):
+            captured["closed"] = True
+
     def fake_init(**kwargs):
         captured["workflow"] = kwargs["workflow"]
         captured["context"] = kwargs["context"]
+        captured["init_kwargs"] = kwargs
         return FakeSDK()
 
     monkeypatch.setattr("unistack.UniStack.init", staticmethod(fake_init))
@@ -125,3 +129,34 @@ def test_serve_missing_workflow_everywhere_exits_clearly(monkeypatch):
     _install_module("fake_agent_no_config", builder="b")
     with pytest.raises(SystemExit, match="workflow is required"):
         _run_serve_argv(["fake_agent_no_config:builder"], monkeypatch, uvicorn)
+
+
+# ── OTel env plumbing: CLI reads the standard vars and passes them in ───────────
+
+def test_serve_passes_otel_env_into_init_and_closes_sdk(monkeypatch):
+    import uvicorn
+    _install_module("fake_agent_no_config", builder="b")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Basic abc")
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "my-service")
+    captured = _run_serve_argv(
+        ["fake_agent_no_config:builder", "--workflow", "content"], monkeypatch, uvicorn)
+    kwargs = captured["init_kwargs"]
+    assert kwargs["otel_endpoint"] == "http://collector:4318"
+    assert kwargs["otel_headers"] == "Authorization=Basic abc"
+    assert kwargs["otel_service_name"] == "my-service"
+    assert captured["closed"] is True            # spans flush on shutdown
+
+
+def test_serve_traces_endpoint_wins_over_generic(monkeypatch):
+    import uvicorn
+    _install_module("fake_agent_no_config", builder="b")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://generic:4318")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://traces:4318/v1/traces")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_HEADERS", raising=False)
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+    captured = _run_serve_argv(
+        ["fake_agent_no_config:builder", "--workflow", "content"], monkeypatch, uvicorn)
+    kwargs = captured["init_kwargs"]
+    assert kwargs["otel_endpoint"] == "http://traces:4318/v1/traces"
+    assert kwargs["otel_service_name"] == "unistack-content"   # default from workflow
