@@ -409,6 +409,51 @@ def test_concurrent_resolve_loses_claim_and_does_not_advance(clean_db):
     assert _checkpoints(clean_db, r.activity_id) > 0   # thread untouched by the loser
 
 
+def test_already_resolved_message_does_not_leak_approver(clean_db):
+    """
+    The no-op message is returned over HTTP to anyone who can call resolve, so it must not
+    hand out the prior approver's identity. Operators get it from the log and the span.
+    """
+    sdk = _sdk("leak")
+    graph = sdk.compile(_two_node_graph(), reviews=["node_a"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    clean_db.hitl_resolutions.update_one(
+        {"activity_id": r.activity_id, "status": "pending"},
+        {"$set": {"status": "resolved", "decision": "approved",
+                  "resolved_by": "secret.approver@corp.com"}})
+    r2 = sdk.resume(graph, r.activity_id, "approved")
+    assert "already resolved" in r2.message
+    assert "approved" in r2.message                      # the decision is the caller's business
+    assert "secret.approver@corp.com" not in r2.message  # the approver's identity is not
+
+
+def test_verified_resolver_is_persisted_in_full(clean_db):
+    """A Resolver records the stable identity and the auth mode, not just a label."""
+    from unistack import Resolver
+
+    sdk = _sdk("resolver")
+    graph = sdk.compile(_two_node_graph(), reviews=["node_a"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    sdk.resume(graph, r.activity_id, "approved", resolved_by=Resolver(
+        label="approver@x", subject="sub-1", issuer="https://idp", auth_mode="oidc"))
+    doc = clean_db.hitl_resolutions.find_one({"activity_id": r.activity_id})
+    assert doc["resolved_by"] == "approver@x"            # unchanged meaning for existing readers
+    assert doc["resolved_by_subject"] == "sub-1"
+    assert doc["resolved_by_issuer"] == "https://idp"
+    assert doc["resolved_auth_mode"] == "oidc"
+
+
+def test_plain_string_resolver_still_works(clean_db):
+    """Library and local callers pass a bare string; it coerces and persists as the label."""
+    sdk = _sdk("coerce")
+    graph = sdk.compile(_two_node_graph(), reviews=["node_a"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    sdk.resume(graph, r.activity_id, "approved", resolved_by="local")
+    doc = clean_db.hitl_resolutions.find_one({"activity_id": r.activity_id})
+    assert doc["resolved_by"] == "local"
+    assert doc["resolved_by_subject"] is None and doc["resolved_auth_mode"] is None
+
+
 def test_resolve_claims_even_without_pending_record(clean_db):
     """Crash-recovery: pending record missing → the resolve's insert IS the claim."""
     sdk = _sdk("orphan")

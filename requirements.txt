@@ -6,4 +6,8 @@ opentelemetry-sdk>=1.30,<2
 opentelemetry-exporter-otlp-proto-http>=1.30,<2   # OTLP/HTTP protobuf — what Langfuse ingests
 
 # Optional (graph-runtime server / `unistack serve`):
-#   pip install -e ".[server]"   → fastapi, uvicorn
+#   pip install -e ".[server]"   → fastapi, uvicorn, pyjwt[crypto]
+# Optional (running the test suite):
+#   pip install -e ".[dev]"      → pytest, httpx
+# Both:
+#   pip install -e ".[server,dev]"

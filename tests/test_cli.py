@@ -53,7 +53,12 @@ def test_bad_spec_without_colon_exits():
 
 # ── _serve merge semantics (via main(), mocking UniStack/uvicorn) ──────────────
 
-def _run_serve_argv(argv, monkeypatch, patch_uvicorn):
+# Auth is mandatory, so every serve invocation needs a mode. The merge-semantics tests below
+# are not about auth, so they get a static-token default prepended and stay unchanged.
+DEV_AUTH = ("--auth-mode", "token", "--token", "dev")
+
+
+def _run_serve_argv(argv, monkeypatch, patch_uvicorn, auth_argv=DEV_AUTH):
     """Run `unistack serve <argv>`, capturing the sdk.compile() guards/reviews/context/workflow."""
     captured = {}
 
@@ -72,10 +77,17 @@ def _run_serve_argv(argv, monkeypatch, patch_uvicorn):
         captured["init_kwargs"] = kwargs
         return FakeSDK()
 
+    class FakeApp:
+        state = types.SimpleNamespace(verifier=types.SimpleNamespace(prewarm=lambda: None))
+
+    def fake_create_app(sdk, graph, **kw):
+        captured["auth"] = kw.get("auth")
+        return FakeApp()
+
     monkeypatch.setattr("unistack.UniStack.init", staticmethod(fake_init))
-    monkeypatch.setattr("unistack.server.create_app", lambda sdk, graph, token=None: "app")
+    monkeypatch.setattr("unistack.server.create_app", fake_create_app)
     monkeypatch.setattr(patch_uvicorn, "run", lambda app, host, port: None)
-    monkeypatch.setattr(sys, "argv", ["unistack", "serve", *argv])
+    monkeypatch.setattr(sys, "argv", ["unistack", "serve", *auth_argv, *argv])
     main()
     return captured
 
@@ -160,3 +172,58 @@ def test_serve_traces_endpoint_wins_over_generic(monkeypatch):
     kwargs = captured["init_kwargs"]
     assert kwargs["otel_endpoint"] == "http://traces:4318/v1/traces"
     assert kwargs["otel_service_name"] == "unistack-content"   # default from workflow
+
+
+# ── Auth configuration ─────────────────────────────────────────────────────────
+
+def test_serve_builds_static_token_auth_config(monkeypatch):
+    import uvicorn
+    _install_module("fake_agent_no_config", builder="b")
+    monkeypatch.setenv("UNISTACK_DEV_IDENTITY", "me@local")
+    monkeypatch.setenv("UNISTACK_TOKEN_SCOPES", "activity.start")
+    captured = _run_serve_argv(
+        ["fake_agent_no_config:builder", "--workflow", "content"], monkeypatch, uvicorn,
+        auth_argv=("--auth-mode", "token", "--token", "s3cret"))
+    auth = captured["auth"]
+    assert auth.mode == "token" and auth.token == "s3cret"
+    assert auth.identity == "me@local"
+    assert auth.token_scopes == frozenset({"activity.start"})   # narrowed → 403 path testable
+
+
+def test_serve_reads_oidc_config_from_env(monkeypatch):
+    """OIDC settings are env-only, like MONGO_URI and OTEL_* — no flags to keep in sync."""
+    import uvicorn
+    _install_module("fake_agent_no_config", builder="b")
+    monkeypatch.setenv("UNISTACK_OIDC_JWKS_URL", "https://env-idp/jwks")
+    monkeypatch.setenv("UNISTACK_OIDC_ISSUER", "https://env-idp")
+    monkeypatch.setenv("UNISTACK_OIDC_AUDIENCE", "aud-a, aud-b")
+    captured = _run_serve_argv(
+        ["fake_agent_no_config:builder", "--workflow", "content"], monkeypatch, uvicorn,
+        auth_argv=())
+    auth = captured["auth"]
+    assert auth.mode == "oidc"                      # oidc is the default mode
+    assert auth.jwks_url == "https://env-idp/jwks"
+    assert auth.audience == ("aud-a", "aud-b")      # comma-separated for audience migration
+
+
+def test_serve_token_flag_wins_over_env(monkeypatch):
+    import uvicorn
+    _install_module("fake_agent_no_config", builder="b")
+    monkeypatch.setenv("UNISTACK_API_TOKEN", "from-env")
+    captured = _run_serve_argv(
+        ["fake_agent_no_config:builder", "--workflow", "content"], monkeypatch, uvicorn,
+        auth_argv=("--auth-mode", "token", "--token", "from-flag"))
+    assert captured["auth"].token == "from-flag"
+
+
+@pytest.mark.parametrize("auth_argv", [
+    (),                             # oidc mode, nothing configured
+    ("--auth-mode", "token"),       # token mode, no token
+])
+def test_serve_refuses_to_boot_without_complete_auth_config(monkeypatch, auth_argv):
+    """Serving open is not reachable: incomplete auth config exits, it does not degrade."""
+    import uvicorn
+    _install_module("fake_agent_no_config", builder="b")
+    with pytest.raises(SystemExit):
+        _run_serve_argv(["fake_agent_no_config:builder", "--workflow", "content"],
+                        monkeypatch, uvicorn, auth_argv=auth_argv)

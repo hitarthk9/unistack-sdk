@@ -85,6 +85,42 @@ class RunResult:
         self.state = self.state or {}
 
 
+@dataclass(frozen=True)
+class Resolver:
+    """
+    Who performed an action, for the audit record.
+
+    A plain string still works everywhere a resolver is accepted (it coerces to a bare
+    label), so local and library callers are unaffected. The graph-runtime supplies the
+    full object, built from verified token claims — see `unistack.auth.Principal`.
+
+    `label` is what `resolved_by` has always meant. `subject`+`issuer` is the only stable
+    identity (emails are mutable and reusable, and `subject` is unique only within an
+    issuer). `auth_mode` records whether identity was actually VERIFIED — without it a
+    static-token dev attribution is indistinguishable from a real one in the audit trail.
+    """
+
+    label: str
+    subject: str | None = None
+    issuer: str | None = None
+    auth_mode: str | None = None
+
+    @classmethod
+    def coerce(cls, value: "str | Resolver | None") -> "Resolver | None":
+        if value is None or isinstance(value, cls):
+            return value
+        return cls(label=str(value))
+
+    def attrs(self, key: str) -> dict:
+        """Telemetry attributes; Nones are dropped so absent claims add no empty keys."""
+        return {k: v for k, v in {
+            key: self.label,
+            f"{key}.subject": self.subject,
+            f"{key}.issuer": self.issuer,
+            "unistack.auth.mode": self.auth_mode,
+        }.items() if v}
+
+
 class UniStack:
     """Guardrail + durable HITL orchestration for LangGraph graphs."""
 
@@ -190,7 +226,7 @@ class UniStack:
         return result
 
     def resume(self, graph, activity_id: str, decision: str,
-               resolved_by: str | None = None) -> RunResult:
+               resolved_by: "str | Resolver | None" = None) -> RunResult:
         """
         Continue a paused activity with a human decision ("approved" / "rejected").
         Loads the persisted checkpoint — works in a different process, after a restart.
@@ -207,15 +243,17 @@ class UniStack:
         """
         if decision not in _DECISIONS:
             raise ValueError(f"decision must be one of {_DECISIONS}, got {decision!r}")
+        resolver = Resolver.coerce(resolved_by)
         with self._telemetry.leg("resume", activity_id,
                                  {"unistack.decision": decision,
-                                  "unistack.resolved_by": resolved_by or ""}) as span:
-            result = self._resume(graph, activity_id, decision, resolved_by)
+                                  **(resolver.attrs("unistack.resolved_by") if resolver
+                                     else {"unistack.resolved_by": ""})}) as span:
+            result = self._resume(graph, activity_id, decision, resolver)
             self._telemetry.stamp_result(span, result)
         return result
 
     def _resume(self, graph, activity_id: str, decision: str,
-                resolved_by: str | None) -> RunResult:
+                resolver: "Resolver | None") -> RunResult:
         config = self._config(activity_id)
         snapshot = graph.get_state(config)
         checkpoint_id = snapshot.config.get("configurable", {}).get("checkpoint_id")
@@ -229,20 +267,30 @@ class UniStack:
             return RunResult(activity_id, {}, "not_found",
                              message=f"no such activity: '{activity_id}'")
 
-        claimed = self._claim_resolution(activity_id, checkpoint_id, decision, resolved_by)
+        claimed = self._claim_resolution(activity_id, checkpoint_id, decision, resolver)
         if claimed is None:
             prior = self._resolutions().find_one(
                 {"activity_id": activity_id, "checkpoint_id": checkpoint_id}) or {}
             status = "paused" if snapshot.next else "completed"
+            # The prior approver's identity is deliberately NOT in this message: it is
+            # returned over HTTP to anyone who can call resolve, and with verified
+            # identities that would hand out an approver's email. Operators get it from
+            # the log and the span instead.
+            logger.info("pause %s/%s already resolved (%s by %s)", activity_id, checkpoint_id,
+                        prior.get("decision"), prior.get("resolved_by"))
+            self._telemetry.add_event("resolution_lost", {
+                "decision": str(prior.get("decision") or ""),
+                "prior_resolved_by": str(prior.get("resolved_by") or ""),
+                "checkpoint_id": checkpoint_id or ""})
             return RunResult(
                 activity_id, dict(snapshot.values), status,
-                message=(f"pause already resolved ({prior.get('decision')} "
-                         f"by {prior.get('resolved_by')}) — no-op"))
+                message=f"pause already resolved ({prior.get('decision')}) — no-op")
 
         self._telemetry.add_event("resolution_claimed", {
-            "decision": decision, "resolved_by": resolved_by or "",
-            "checkpoint_id": checkpoint_id or ""})
-        self._emit_pause_span(claimed, decision, resolved_by)
+            "decision": decision, "checkpoint_id": checkpoint_id or "",
+            **({k: str(v) for k, v in resolver.attrs("resolved_by").items()} if resolver
+               else {"resolved_by": ""})})
+        self._emit_pause_span(claimed, decision, resolver)
         if claimed.get("trace_id") and claimed.get("span_id"):
             self._telemetry.link_current_to(claimed["trace_id"], claimed["span_id"])
         if decision != "approved":               # reject always halts the activity
@@ -424,7 +472,7 @@ class UniStack:
             logger.warning("could not record pending pause for %s: %s", activity_id, exc)
 
     def _claim_resolution(self, activity_id: str, checkpoint_id: str,
-                          decision: str, resolved_by: str | None) -> dict | None:
+                          decision: str, resolver: "Resolver | None") -> dict | None:
         """
         Atomically claim this pause's resolution — exactly one resolver wins. Returns
         the claimed pending doc (its pre-image: node, message, opened_at, trace ids),
@@ -433,8 +481,15 @@ class UniStack:
         insert IS the claim; a duplicate-key error means someone else just won.
         """
         coll = self._resolutions()
+        # `resolved_by` keeps its meaning (the human-readable label) so existing readers and
+        # UIs are untouched; the subject/issuer pair is the stable identity, and auth_mode
+        # is what tells an auditor a verified approver from a dev-mode attribution.
         fields = {"status": "resolved", "decision": decision,
-                  "resolved_by": resolved_by, "resolved_at": datetime.now(timezone.utc)}
+                  "resolved_by": resolver.label if resolver else None,
+                  "resolved_by_subject": resolver.subject if resolver else None,
+                  "resolved_by_issuer": resolver.issuer if resolver else None,
+                  "resolved_auth_mode": resolver.auth_mode if resolver else None,
+                  "resolved_at": datetime.now(timezone.utc)}
         won = coll.find_one_and_update(
             {"activity_id": activity_id, "checkpoint_id": checkpoint_id, "status": "pending"},
             {"$set": fields})
@@ -477,7 +532,7 @@ class UniStack:
 
     # ── HITL pause span (emitted retroactively — OTLP cannot export open spans) ──
 
-    def _emit_pause_span(self, doc: dict, decision: str, resolved_by: str | None) -> None:
+    def _emit_pause_span(self, doc: dict, decision: str, resolver: "Resolver | None") -> None:
         """
         Emit the completed `hitl_pause` span into the pausing leg's trace: parent and
         start time come from the pending doc persisted at pause time, the end is now —
@@ -501,7 +556,8 @@ class UniStack:
             "unistack.pause.node": doc.get("node"),
             "unistack.pause.message": _clip(doc["message"], 1000) if doc.get("message") else None,
             "unistack.decision": decision,
-            "unistack.resolved_by": resolved_by or "",
+            **(resolver.attrs("unistack.resolved_by") if resolver
+               else {"unistack.resolved_by": ""}),
         })
 
     # ── Local interactive decision (run() default) ─────────────────────────────

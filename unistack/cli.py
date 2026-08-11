@@ -4,8 +4,14 @@ hand-written init/compile boilerplate. Mirrors how `langgraph` serves a graph.
 
 The CLI is the consuming app here: it reads its own environment (MONGO_URI,
 ANTHROPIC_API_KEY, OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-OTEL_EXPORTER_OTLP_HEADERS, OTEL_SERVICE_NAME, UNISTACK_API_TOKEN) and passes the
-values explicitly into UniStack — the SDK itself still reads no environment.
+OTEL_EXPORTER_OTLP_HEADERS, OTEL_SERVICE_NAME, and the UNISTACK_AUTH_MODE /
+UNISTACK_OIDC_* / UNISTACK_SCOPE_* / UNISTACK_API_TOKEN / UNISTACK_DEV_IDENTITY /
+UNISTACK_TOKEN_SCOPES auth vars) and passes the values explicitly into UniStack — the SDK
+itself still reads no environment.
+
+Auth is required. In the default `oidc` mode the JWKS URL, issuer and audience must all be
+supplied or the runtime refuses to boot; `--auth-mode token` is a local-dev fallback. There
+is no way to serve without authentication.
 
 Governance (workflow / guards / reviews / context) can also be declared as plain data next
 to the builder — a module-level `UNISTACK_CONFIG` dict — so a deploy command doesn't need to
@@ -35,11 +41,37 @@ def _load_builder_and_config(spec: str):
     return builder, config
 
 
+def _build_auth(args, AuthConfig):
+    """
+    Auth settings come from the environment, like MONGO_URI and every OTEL_* var; only the
+    two you actually type in local dev are flags. Misconfiguration EXITS rather than falling
+    back to an open runtime — refusing to boot is what makes "no unauthenticated mode" real.
+    """
+    env = os.environ.get
+    mode = (args.auth_mode or env("UNISTACK_AUTH_MODE") or "oidc").lower()
+    try:
+        if mode == "oidc":
+            return AuthConfig.oidc(jwks_url=env("UNISTACK_OIDC_JWKS_URL", ""),
+                                   issuer=env("UNISTACK_OIDC_ISSUER", ""),
+                                   audience=env("UNISTACK_OIDC_AUDIENCE", ""))
+        if mode == "token":
+            return AuthConfig.static_token(token=args.token or env("UNISTACK_API_TOKEN", ""),
+                                           identity=env("UNISTACK_DEV_IDENTITY", "dev@local"),
+                                           scopes=env("UNISTACK_TOKEN_SCOPES") or None)
+    except ValueError as exc:
+        sys.exit(f"[UniStack] cannot start: {exc}.\n"
+                 "  Set UNISTACK_OIDC_JWKS_URL / _ISSUER / _AUDIENCE,\n"
+                 "  or run local dev with:  --auth-mode token --token <secret>")
+    sys.exit(f"[UniStack] unknown --auth-mode {mode!r} (expected 'oidc' or 'token')")
+
+
 def _serve(args) -> None:
     from unistack import UniStack
-    from unistack.server import create_app
+    from unistack.server import AuthConfig, create_app
     import uvicorn
 
+    # Resolve auth first: a misconfiguration should exit before any Mongo/LLM setup work.
+    auth = _build_auth(args, AuthConfig)
     builder, config = _load_builder_and_config(args.builder)
 
     workflow = args.workflow or config.get("workflow")
@@ -64,15 +96,18 @@ def _serve(args) -> None:
         context=context,
     )
     graph = sdk.compile(builder, guards=guards, reviews=reviews)
-    token = args.token or os.environ.get("UNISTACK_API_TOKEN") or None
-    if not token:
-        print("[UniStack] WARNING: serving WITHOUT authentication — anyone who can reach "
-              "this port can start and approve activities. Set --token or UNISTACK_API_TOKEN.")
-    print(f"[UniStack] serving '{workflow}' from {args.builder} "
-          f"(guards={list(guards)}, reviews={reviews}, "
-          f"auth={'bearer token' if token else 'OFF'}) on {args.host}:{args.port}")
+
+    # flush=True: stdout is block-buffered when piped to a container log, and an auth
+    # warning nobody sees until shutdown is worthless.
+    auth_line = (f"auth=oidc issuer={auth.issuer} aud={','.join(auth.audience)}"
+                 if auth.mode == "oidc" else
+                 f"auth=token (LOCAL DEV ONLY — identity is NOT verified; every resolution "
+                 f"is attributed to '{auth.identity}') scopes={sorted(auth.token_scopes)}")
+    print(f"[UniStack] serving '{workflow}' from {args.builder} (guards={list(guards)}, "
+          f"reviews={reviews}) on {args.host}:{args.port}\n[UniStack] {auth_line}", flush=True)
+
     try:
-        uvicorn.run(create_app(sdk, graph, token=token), host=args.host, port=args.port)
+        uvicorn.run(create_app(sdk, graph, auth=auth), host=args.host, port=args.port)
     finally:
         sdk.close()      # flush buffered spans (BatchSpanProcessor) on shutdown
 
@@ -95,9 +130,15 @@ def main() -> None:
     serve.add_argument("--context", default=None,
                        help="Business context for the guardrail judge. Overrides "
                             "UNISTACK_CONFIG['context'] if given.")
+    # Auth settings are env-driven, like MONGO_URI and OTEL_*; only these two are flags,
+    # because they are what you type by hand in local dev.
+    serve.add_argument("--auth-mode", choices=("oidc", "token"), default=None,
+                       help="'oidc' (default) validates JWTs against UNISTACK_OIDC_JWKS_URL / "
+                            "_ISSUER / _AUDIENCE; 'token' is a LOCAL-DEV static bearer token. "
+                            "Env: UNISTACK_AUTH_MODE. There is no unauthenticated mode.")
     serve.add_argument("--token", default=None,
-                       help="Bearer token required on the POST endpoints "
-                            "(default: UNISTACK_API_TOKEN env var; unset = no auth, with a warning)")
+                       help="Static bearer token for --auth-mode token. Env: UNISTACK_API_TOKEN "
+                            "(see also UNISTACK_DEV_IDENTITY, UNISTACK_TOKEN_SCOPES)")
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
     serve.set_defaults(func=_serve)

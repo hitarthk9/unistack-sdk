@@ -72,6 +72,16 @@ sdk.close()                                                # also flushes buffer
 #   .status: "completed" | "paused" | "hitl_rejected" | "not_found" | "failed"
 ```
 
+`resolved_by` accepts a plain **string** (a bare label — what local and library callers pass)
+or a **`Resolver`** carrying verified identity:
+
+```python
+Resolver(label="approver@x", subject="sub-1", issuer="https://idp", auth_mode="oidc")
+```
+
+The graph-runtime builds one from the caller's validated token. Strings coerce automatically,
+so nothing that passed a string before needs to change.
+
 ### `UniStack.init()` parameters
 
 | Param | Required | Purpose |
@@ -122,8 +132,9 @@ The focused **graph-runtime** is the only component that imports the graph + SDK
 `POST /activities` (start) and `POST /activities/{id}/resolve` (resume), nothing else:
 
 ```bash
-UNISTACK_API_TOKEN=<secret> unistack serve my_app.graph:builder --workflow content \
+unistack serve my_app.graph:builder --workflow content \
   --guard "generate=No unverified claims." --review publish --context "Brand voice: …"
+# auth comes from UNISTACK_OIDC_* env vars — see the Auth section below
 ```
 
 **`UNISTACK_CONFIG` — governance as data, collocated with the graph.** Passing policy text
@@ -148,14 +159,62 @@ to `unistack serve my_app.graph:builder` — no flags. CLI flags still work and 
 `--context`/`--workflow` override outright if passed. Useful for a one-off ops override without a
 redeploy, without making the common case carry the whole policy on the command line.
 
-Install with the server extra: `pip install "unistack[server]"` (adds fastapi + uvicorn).
-**Auth:** with `--token` / `UNISTACK_API_TOKEN` set, both POST endpoints require
-`Authorization: Bearer <token>` (401 otherwise); serving without one prints a loud warning —
-an open runtime lets anyone who can reach the port start and approve activities. `/health`
-stays open. Everything read-only (listing pending approvals, fetching pause history) is **not**
-here — it reads the `hitl_resolutions` Mongo collection (see unistack-api). Self-host anywhere
-(Azure Container Apps, etc.) with a managed Mongo. **Scaling:** state is durable and pause
-resolution is claim-based, so multiple uvicorn workers / replicas behind a load balancer are safe.
+Install with the server extra: `pip install "unistack[server]"` (fastapi + uvicorn + pyjwt).
+Everything read-only (listing pending approvals, fetching pause history) is **not** here — it
+reads the `hitl_resolutions` Mongo collection (see unistack-api). Self-host anywhere (Azure
+Container Apps, etc.) with a managed Mongo. **Scaling:** state is durable and pause resolution
+is claim-based, so multiple uvicorn workers / replicas behind a load balancer are safe.
+
+## Auth
+
+Token verification lives in the shared **`unistack-auth`** package — see
+[its CLAUDE.md](../unistack-auth/CLAUDE.md) for the `Principal` shape, claim mapping, status-code
+taxonomy and hard rules. **This repo owns only the wiring**, which is:
+
+| Endpoint | Scope required |
+|---|---|
+| `POST /activities` | `activity.start` |
+| `POST /activities/{id}/resolve` | `activity.resolve` |
+| `GET /health` | none — liveness probes carry no token |
+
+**Auth is mandatory and not omittable** — `auth` is a required keyword-only argument to
+`create_app`, and `unistack serve` exits rather than degrading when config is incomplete.
+
+```bash
+# Production — env-driven, like MONGO_URI and OTEL_*
+export UNISTACK_OIDC_JWKS_URL=https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys
+export UNISTACK_OIDC_ISSUER=https://login.microsoftonline.com/<tenant>/v2.0
+export UNISTACK_OIDC_AUDIENCE=api://unistack-runtime
+unistack serve my_app.graph:builder
+
+# Local dev — no IdP needed; identity is CONFIGURED, never taken from the caller
+unistack serve my_app.graph:builder --auth-mode token --token dev-secret
+```
+
+> **Grant the two scopes to DIFFERENT identities.** Separation is what stops an agent approving
+> its own guardrail breaches, but only if an operator actually grants them apart — one service
+> principal holding both still self-approves every run. A real `--deny-self-approval` check
+> needs `started_by` on the activity record, which arrives with BUILD_PLAN item 3.
+
+**The approver cannot be forged.** `resolved_by` is no longer accepted in the resolve body
+(sending it is a **422**); the verified `Principal` becomes the `Resolver` written to the audit
+doc as `resolved_by` (label, unchanged meaning) plus `resolved_by_subject`, `resolved_by_issuer`
+and `resolved_auth_mode` — that last field is what distinguishes a verified approver from a
+dev-mode attribution.
+
+`tests/conftest.py` generates an RSA keypair and serves its JWKS over loopback, so the auth
+tests need no identity provider.
+
+> **The gotcha that costs an hour:** Keycloak puts `account` in `aud` by default, not your
+> client. Add an **Audience** protocol mapper to the client scope or every token 401s on
+> audience and it looks like a UniStack bug.
+
+```bash
+JWKS=http://localhost:8080/realms/unistack/protocol/openid-connect/certs
+ISS=http://localhost:8080/realms/unistack
+curl -d grant_type=client_credentials -d client_id=runner -d client_secret=… \
+     -d scope=activity.start $ISS/protocol/openid-connect/token
+```
 
 ## OpenTelemetry — the span model
 
@@ -189,15 +248,16 @@ tracing backend, and a telemetry failure can never change a verdict or a run's o
 
 ```
 unistack/
-  __init__.py      ← exports UniStack, RunResult, UniStackError; NullHandler on the logger
+  __init__.py      ← exports UniStack, RunResult, Resolver, UniStackError; NullHandler on the logger
   core.py          ← UniStack: init, compile, start, resume, run, guard eval, resolution
-                     claims, retroactive hitl_pause emission
+                     claims, retroactive hitl_pause emission; Resolver (audit identity)
   _telemetry.py    ← Telemetry (instance-scoped OTel provider/spans, fail-open) +
                      OTelCallbackHandler (LangChain events → OTel spans, GenAI semconv)
   _guardrail.py    ← evaluate_guardrail() via Claude tool-use (keyword-scan fallback; fail-closed)
-  server.py        ← create_app(sdk, graph, token): the focused graph-runtime (FastAPI, bearer auth)
+  server.py        ← create_app(sdk, graph, *, auth): the focused graph-runtime (FastAPI)
   cli.py           ← `unistack serve module:builder …`; discovers a sibling UNISTACK_CONFIG
 pyproject.toml  requirements.txt  README.md
+tests/conftest.py (RSA keypair + loopback JWKS + make_token)  tests/test_auth.py
 tests/test_guardrail.py  tests/test_telemetry.py  tests/test_server.py  tests/test_cli.py
 ```
 
@@ -209,9 +269,10 @@ Database `unistack` (configurable). The SDK writes the **durable checkpointer** 
 It is three things at once: the per-pause resolution **lock** (exactly one resolver wins;
 duplicates become no-ops), the **pending-approvals index** (`status: "pending"`, with node,
 message, workflow, opened_at — what unistack-api lists), and the **audit record** (decision,
-resolved_by, resolved_at, plus the pausing leg's OTel `trace_id`/`span_id` for deep-linking
-into the tracing backend). It is **not** a queue — nothing polls it; resolution is
-request-driven. Resolution docs are kept after an activity terminates (bounded: one per pause).
+`resolved_by` + `resolved_by_subject` + `resolved_by_issuer` + `resolved_auth_mode`,
+resolved_at, plus the pausing leg's OTel `trace_id`/`span_id` for deep-linking into the tracing
+backend). It is **not** a queue — nothing polls it; resolution is request-driven. Resolution
+docs are kept after an activity terminates (bounded: one per pause).
 
 **Retention.** The moment an activity reaches a terminal outcome (completed or rejected), its
 thread is deleted via `MongoDBSaver.delete_thread(activity_id)` — nothing will ever resume from it
@@ -236,7 +297,10 @@ Notes:
 the graph config; `trace.set_tracer_provider` is never called, no `OTEL_*` globals). The
 `unistack serve` CLI, acting as the consuming app, reads `MONGO_URI` / `ANTHROPIC_API_KEY` /
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) /
-`OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_SERVICE_NAME` / `UNISTACK_API_TOKEN` and passes them in.
+`OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_SERVICE_NAME`, plus the auth vars — `UNISTACK_AUTH_MODE`,
+`UNISTACK_OIDC_JWKS_URL`, `UNISTACK_OIDC_ISSUER`, `UNISTACK_OIDC_AUDIENCE`,
+`UNISTACK_API_TOKEN`, `UNISTACK_DEV_IDENTITY`, `UNISTACK_TOKEN_SCOPES` — and passes them in.
+`auth.py` itself reads no environment: it receives an `AuthConfig`.
 Note `langsmith` remains installed *transitively* (langchain-core requires it) — never set
 `LANGSMITH_TRACING=true` in a deployment env, or langchain's own global tracer re-activates.
 
@@ -251,9 +315,13 @@ terminal prompt, which is deliberately stdin/stdout.
 
 ```bash
 python3.13 -m venv venv
-venv/bin/python -m pip install -e ".[server]"
-PYTHONPATH=. venv/bin/python -m pytest tests/ -v   # needs MongoDB on localhost:27017
+venv/bin/python -m pip install -e ".[server,dev]"   # server: fastapi/uvicorn/pyjwt · dev: pytest/httpx
+PYTHONPATH=. venv/bin/python -m pytest tests/ -v    # needs MongoDB on localhost:27017
 ```
+
+Auth tests need no IdP: `tests/conftest.py` generates an RSA keypair per session and serves its
+JWKS from a loopback HTTP server, so the real `PyJWKClient` fetch/cache path is exercised with
+no network and no test-only seam in shipped code.
 
 ## Hard constraints
 
@@ -280,8 +348,50 @@ PYTHONPATH=. venv/bin/python -m pytest tests/ -v   # needs MongoDB on localhost:
    instrumentor may monkey-patch LangChain/LangGraph.
 10. `langgraph` stays a version RANGE (`>=1.2,<2.0`), never a pin — the SDK must install
     alongside whatever LangGraph the consumer's agent already uses.
+11. Auth is neither optional nor omittable: `create_app` takes `auth` as a required
+    keyword-only argument and the CLI exits on incomplete config, so there is no code path
+    that serves an open runtime. The audit identity comes from verified token claims, never
+    from a request body. Starting and resolving are separate scopes. Only `RS256` is
+    accepted and the algorithm is never read from the token.
 
 ## Roadmap
+
+### Agreed build order (August 2026) — see `../BUILD_PLAN.md` for the full plan
+
+The SDK items, in order. Do not start one before its predecessors.
+
+1. ~~**Inbound identity & authorization.**~~ **DONE (v0.3.0)** — see the Auth section above.
+   Validated OIDC/JWT with separate `activity.start` / `activity.resolve` scopes, `resolved_by`
+   derived from verified claims (and rejected with 422 if sent in the body), static-token dev
+   mode behind `--auth-mode token`, and the open mode removed entirely. Also fixed here: the
+   already-resolved message no longer leaked the prior approver's identity to any caller.
+   *Still open, deliberately:* one identity holding both scopes can self-approve. Closing that
+   needs `started_by` on the activity record, which item 3 introduces.
+2. **LiteLLM gateway.** `base_url` + model **alias** (`agent-primary` / `judge-fast`) plumbed
+   through `UniStack.init()` into `_guardrail.py`, via the Anthropic passthrough route so
+   forced tool-use stays exact. SDK sets guardrails per request (default-on is a LiteLLM
+   enterprise feature). `activity_id`/`workflow`/`node` in request metadata. W3C `traceparent`
+   propagated so gateway spans nest inside the node span. **Budget exhaustion opens a HITL
+   pause, not a crash.** LiteLLM must never log to Langfuse.
+3. **Activity record.** One small doc per activity in `unistack.activities` at start, updated
+   at terminal, carrying outcome, `trace_id`, and `analysis_status: "pending"`. Today a run
+   that never pauses leaves *no* durable record — checkpoints are deleted at terminal and
+   `hitl_resolutions` only exists when something paused, so the only evidence is a fail-open
+   trace. Same weight and role as `hitl_resolutions`: an index and audit record, not a queue.
+4. **Trace enrichment.** Capture retrieval/context inputs as node-span attributes and tag
+   traces with `workflow`. Langfuse evaluators can only judge what the spans contain — a
+   groundedness judge that cannot see the retrieved context produces confident noise.
+5. **Security layer** (distinct from guards — see below). Layer 1 always on and deterministic:
+   tool allow-list, argument inspection (secrets, PII, destructive verbs), untrusted-source
+   flagging. Layer 2 LLM security judge behind a trigger only (ambiguous flag, high-risk tool,
+   retrieved content) — never on by default. Findings to `unistack.security_events` in Mongo
+   (authoritative, telemetry-independent) plus a span event for trace correlation.
+
+**The security check is not the business-policy guard.** A guard runs *after* a node, judges
+its *output* against policy, and *pauses for a human*. A security check runs *before* a call
+goes out, inspects the *proposed call and arguments*, and *blocks outright*. Different
+question, different moment, different response — keep them separate. And do not LLM what a
+list can do: allow-lists and pattern checks are cheaper, faster, non-flaky, and auditable.
 
 ### Planned (must-have, not yet built)
 
@@ -317,10 +427,14 @@ PYTHONPATH=. venv/bin/python -m pytest tests/ -v   # needs MongoDB on localhost:
 ### Deferred by design (do NOT re-propose without new reasons)
 
 - **Runtime evaluators — rejected in the hot path.** Only things that must *gate* execution live
-  mid-run (that is what guards/reviews are). Measurement/scoring (compliance, revenue, quality,
-  KRA/ROI) is a **pure function of the completed trace** → belongs in **unistack-brain**, offline,
-  fully customizable per client. Keeping the runtime lean is deliberate. (If a score must influence
-  control flow, that is a guard/router, not an evaluator.)
+  mid-run — guards, reviews, and (new) security blocks. Measurement/scoring (compliance, revenue,
+  quality, hallucination, groundedness, KRA/ROI) is a **pure function of the completed trace**,
+  runs offline, and adds zero latency to the agent. Keeping the runtime lean is deliberate.
+  (If a score must influence control flow, that is a guard/router, not an evaluator.)
+  **Updated Aug 2026 — the destination changed, the principle did not:** scoring now runs as
+  **Langfuse evaluators** on live observations (self-hosted Langfuse includes them free;
+  sampling + async, judge model pointed at LiteLLM), with the **projector** in `unistack-api`
+  assembling projections from traces + scores. `unistack-brain` is being retired.
 - **A "Tables" data abstraction — rejected.** The LangGraph author can already read/write any
   Mongo/Postgres table directly from their own nodes (plain Python); wrapping that would be scope
   creep and would violate the thin-latch-on principle. The only structured store UniStack owns is

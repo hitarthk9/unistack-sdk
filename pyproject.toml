@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unistack"
-version = "0.2.0"
+version = "0.3.0"
 description = "Guardrails + human-in-the-loop for existing LangGraph agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,9 +31,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# unistack-auth lives here, not in a separate [auth] extra: token verification exists solely
+# to serve HTTP, and a standalone [server] would otherwise install a server that cannot boot
+# in its default (oidc) mode.
 server = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
+    "unistack-auth>=0.1",        # shared OIDC/JWT verification (pulls pyjwt)
+]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",          # starlette's TestClient — present only transitively otherwise
 ]
 
 [project.scripts]
