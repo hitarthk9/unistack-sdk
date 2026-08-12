@@ -61,7 +61,7 @@ node is **not supported** — the SDK detects it and raises `UniStackError` inst
 sdk   = UniStack.init(...)                                  # see parameters below
 graph = sdk.compile(builder, guards={"n": "policy"}, reviews=["m"])
 
-r = sdk.start(graph, initial_state, run_id=None)           # non-blocking; run_id → unique ts+hex
+r = sdk.start(graph, initial_state, run_id=None, started_by=None)   # non-blocking; ts+hex id
 r = sdk.resume(graph, activity_id, decision, resolved_by=None)   # "approved" | "rejected"
 r = sdk.run(graph, initial_state, decide=None)             # local convenience over start/resume
 sdk.evaluate("policy", output_str)                         # {"passed", "reason"} — raw guard check
@@ -186,6 +186,13 @@ tests/test_telemetry.py   ← span shape (InMemorySpanExporter; no network)
 
 Database `unistack` (configurable). The SDK writes the **durable checkpointer** collections
 (`checkpoints`, `checkpoint_writes`) — LangGraph's persisted graph state — plus
+**`activities`**: one small doc per activity, `_id = activity_id` — written at start and
+closed at terminal, carrying the outcome, `trace_id`, `started_by` and `analysis_status`. It is
+the durable proof a run happened: without it, an activity that never pauses leaves nothing
+behind but a fail-open Langfuse trace. The logic lives in **`unistack-telemetry`**
+(`ActivityRecords`) so a non-LangGraph integration inherits it; this SDK only hands over the
+collection and calls it at start/terminal.
+
 **`hitl_resolutions`**: one tiny doc per pause, unique on `(activity_id, checkpoint_id)`.
 It is three things at once: the per-pause resolution **lock** (exactly one resolver wins;
 duplicates become no-ops), the **pending-approvals index** (`status: "pending"`, with node,

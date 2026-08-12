@@ -36,7 +36,7 @@ def clean_db():
 
 
 def _wipe(db):
-    for c in ("checkpoints", "checkpoint_writes", "hitl_resolutions"):
+    for c in ("checkpoints", "checkpoint_writes", "hitl_resolutions", "activities"):
         db[c].drop()
 
 
@@ -595,3 +595,97 @@ def test_sdk_passes_gateway_config_and_metadata_through(clean_db):
     assert openai_cls.call_args.kwargs == {"api_key": "sk-virtual", "base_url": "http://gw/v1"}
     assert create.call_args.kwargs["extra_body"]["metadata"] == {
         "activity_id": "gw-1", "workflow": "gw", "node": "generate"}
+
+
+# ── Activity record: durable proof a run happened (BUILD_PLAN item 3) ──────────
+
+def test_clean_run_with_no_pauses_still_leaves_a_record(clean_db):
+    """
+    The reason this item exists. A run that never breaches a guard deletes its checkpoints
+    at terminal and writes no resolution, so before this the only evidence it ever ran was a
+    Langfuse trace — and telemetry is fail-open.
+    """
+    sdk = _sdk("act-clean")
+    graph = sdk.compile(_one_node_graph("gen"), guards={"gen": "policy"})
+    with patch(EVAL_TARGET, side_effect=_passes):
+        r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "completed"
+    assert _checkpoints(clean_db, r.activity_id) == 0        # nothing left in working state
+
+    doc = clean_db.activities.find_one({"_id": r.activity_id})
+    assert doc["activity_id"] == r.activity_id
+    assert doc["workflow"] == "act-clean"
+    assert doc["status"] == "completed"
+    assert doc["analysis_status"] == "pending"               # handed to the projector
+    assert doc["started_at"] and doc["ended_at"]
+
+
+def test_activity_is_running_while_paused_and_invisible_to_the_projector(clean_db):
+    sdk = _sdk("act-pause")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    assert r.status == "paused"
+
+    doc = clean_db.activities.find_one({"_id": r.activity_id})
+    assert doc["status"] == "running"
+    assert "analysis_status" not in doc                      # projector must not pick it up
+    assert "ended_at" not in doc
+
+    sdk.resume(graph, r.activity_id, "approved")
+    doc = clean_db.activities.find_one({"_id": r.activity_id})
+    assert doc["status"] == "completed" and doc["analysis_status"] == "pending"
+
+
+def test_rejected_activity_records_its_outcome(clean_db):
+    sdk = _sdk("act-rej")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""})
+    sdk.resume(graph, r.activity_id, "rejected")
+    doc = clean_db.activities.find_one({"_id": r.activity_id})
+    assert doc["status"] == "hitl_rejected"
+    assert doc["analysis_status"] == "pending"               # still worth analysing
+
+
+def test_started_by_round_trips_from_a_verified_resolver(clean_db):
+    """What the runtime passes from the request's token — the enabler for self-approval checks."""
+    from unistack import Resolver
+
+    sdk = _sdk("act-who")
+    graph = sdk.compile(_one_node_graph("work"), reviews=["work"])
+    r = sdk.start(graph, {"a": "", "b": ""}, started_by=Resolver(
+        label="starter@x", subject="sub-9", issuer="https://idp", auth_mode="oidc"))
+
+    doc = clean_db.activities.find_one({"_id": r.activity_id})
+    assert doc["started_by"] == "starter@x"
+    assert doc["started_by_subject"] == "sub-9"
+    assert doc["started_by_issuer"] == "https://idp"
+    assert doc["started_by_auth_mode"] == "oidc"
+
+
+def test_a_crashing_node_finalizes_the_record_instead_of_leaving_a_ghost(clean_db):
+    sdk = _sdk("act-boom")
+
+    def explode(state):
+        raise RuntimeError("node blew up")
+
+    b = StateGraph(S)
+    b.add_node("boom", explode)
+    b.add_edge(START, "boom")
+    b.add_edge("boom", END)
+    graph = sdk.compile(b)
+
+    with pytest.raises(RuntimeError):
+        sdk.start(graph, {"a": "", "b": ""})
+
+    doc = clean_db.activities.find_one({"workflow": "act-boom"})
+    assert doc["status"] == "failed"                         # not stuck at "running"
+
+
+def test_activity_record_survives_a_missing_trace(clean_db):
+    """Tracing is off in these tests, so trace_id is simply absent — the record never depends
+    on telemetry being enabled."""
+    sdk = _sdk("act-notrace")
+    graph = sdk.compile(_one_node_graph("gen"))
+    r = sdk.start(graph, {"a": "", "b": ""})
+    doc = clean_db.activities.find_one({"_id": r.activity_id})
+    assert "trace_id" not in doc and doc["status"] == "completed"

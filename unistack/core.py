@@ -58,7 +58,7 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
-from unistack_telemetry import Telemetry, clip
+from unistack_telemetry import TERMINAL_STATUSES, ActivityRecords, Telemetry, clip
 from unistack_telemetry.langchain import callback_handler
 
 if TYPE_CHECKING:
@@ -154,6 +154,7 @@ class UniStack:
         self._db_name = db_name
         self._checkpointer = checkpointer   # None → build MongoDBSaver in compile()
         self._resolutions_indexed = False
+        self._records: "ActivityRecords | None" = None   # lazy — needs the Mongo client
 
         self._guards: dict[str, str] = {}   # node -> policy text
         self._reviews: set[str] = set()     # nodes needing unconditional sign-off
@@ -222,7 +223,8 @@ class UniStack:
 
     # ── Durable, non-blocking run cycle ─────────────────────────────────────────
 
-    def start(self, graph, initial_state: dict, run_id: str | None = None) -> RunResult:
+    def start(self, graph, initial_state: dict, run_id: str | None = None,
+              started_by: "str | Resolver | None" = None) -> RunResult:
         """
         Begin an activity. Runs until the first human pause (guard breach / review) or
         END, then RETURNS — never blocks. On a pause, records a pending resolution in
@@ -231,14 +233,33 @@ class UniStack:
 
         run_id defaults to a UTC microsecond timestamp plus a 4-hex-char suffix, so
         concurrent starts (e.g. on different replicas) can never share a thread.
+
+        `started_by` is the caller's verified identity (a `Resolver`, or a plain string).
+        It is stamped on the trace and persisted on the activity record — the graph-runtime
+        derives it from the request's token, so it cannot be forged.
+
+        A durable record is written in `unistack.activities` at start and closed at terminal,
+        so an activity that never pauses still leaves proof it ran.
         """
         run_id = run_id or (
             f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{secrets.token_hex(2)}"
         )
         activity_id = f"{self._workflow}-{run_id}"
-        with self._telemetry.leg("start", activity_id) as span:
-            result = self._drive(graph, initial_state, activity_id)
+        starter = Resolver.coerce(started_by)
+        with self._telemetry.leg("start", activity_id,
+                                 starter.attrs("unistack.started_by") if starter else None) as span:
+            trace_ids = self._telemetry.current_ids()
+            self.activity_records().started(
+                activity_id, self._workflow,
+                trace_id=trace_ids[0] if trace_ids else None, started_by=starter)
+            try:
+                result = self._drive(graph, initial_state, activity_id)
+            except Exception:
+                # Without this a crashed activity is a permanent ghost stuck at "running".
+                self._finalize_activity(RunResult(activity_id, {}, "failed"))
+                raise
             self._stamp_result(span, result)
+        self._finalize_activity(result)
         return result
 
     def resume(self, graph, activity_id: str, decision: str,
@@ -266,6 +287,7 @@ class UniStack:
                                      else {"unistack.resolved_by": ""})}) as span:
             result = self._resume(graph, activity_id, decision, resolver)
             self._stamp_result(span, result)
+        self._finalize_activity(result)
         return result
 
     def _resume(self, graph, activity_id: str, decision: str,
@@ -471,6 +493,27 @@ class UniStack:
             coll.create_index([("activity_id", 1), ("checkpoint_id", 1)], unique=True)
             self._resolutions_indexed = True
         return coll
+
+    def activity_records(self) -> ActivityRecords:
+        """
+        The durable activity record. The logic lives in `unistack-telemetry` so a non-LangGraph
+        integration inherits it unchanged; this just hands over the collection, which is why
+        that package needs no database driver of its own.
+        """
+        if self._records is None:
+            self._records = ActivityRecords(self._client()[self._db_name]["activities"])
+        return self._records
+
+    def _finalize_activity(self, result: RunResult) -> None:
+        """
+        Close the activity record on a terminal outcome, and hand it to the projector.
+
+        One call site per public entry point rather than one per `_delete_checkpoint`: terminal
+        detection belongs in a single place, and `TERMINAL_STATUSES` comes from the same package
+        that writes the record so the vocabulary cannot drift.
+        """
+        if result.status in TERMINAL_STATUSES:
+            self.activity_records().finalized(result.activity_id, result.status)
 
     def _record_pending(self, activity_id: str, checkpoint_id: str | None, node: str,
                         message: str | None, trace_ids: tuple[str, str] | None) -> None:
