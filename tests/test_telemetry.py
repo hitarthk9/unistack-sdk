@@ -246,17 +246,16 @@ def test_disabled_telemetry_emits_nothing_and_runs_fine(exporter, clean_db):
 # ── Judge LLM call: GenAI span with token usage under guardrail_eval ────────────
 
 def test_judge_llm_span_carries_genai_usage(exporter, sdk_factory):
-    sdk = sdk_factory("otel-judge", anthropic_api_key="sk-ant-fake")
-    block = MagicMock()
-    block.type = "tool_use"
-    block.input = {"passed": True, "reason": "fine"}
+    sdk = sdk_factory("otel-judge", anthropic_api_key="sk-fake",
+                      llm_base_url="http://gateway.invalid/v1")
     resp = MagicMock()
-    resp.content = [block]
     resp.model = "claude-haiku-4-5-20251001"
-    resp.usage.input_tokens = 123
-    resp.usage.output_tokens = 45
-    with patch("anthropic.Anthropic") as anthro:
-        anthro.return_value.messages.create.return_value = resp
+    resp.choices[0].message.tool_calls[0].function.arguments = json.dumps(
+        {"passed": True, "reason": "fine"})
+    resp.usage.prompt_tokens = 123
+    resp.usage.completion_tokens = 45
+    with patch("openai.OpenAI") as openai_cls:
+        openai_cls.return_value.chat.completions.create.return_value = resp
         verdict = sdk.evaluate("no fraud", "clean output", node="gen")
     assert verdict == {"passed": True, "reason": "fine"}
 

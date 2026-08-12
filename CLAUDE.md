@@ -126,97 +126,22 @@ checks the decision (reject always halts), and treats "approve with nothing left
 harmless completed no-op. The old double-approve race is closed by the claim: the loser gets a
 "pause already resolved" no-op result and never advances the graph.
 
-## Deployment — `unistack serve`
+## Deployment
 
-The focused **graph-runtime** is the only component that imports the graph + SDK. It exposes
-`POST /activities` (start) and `POST /activities/{id}/resolve` (resume), nothing else:
+This is a **library**, not a service. The HTTP surface that starts activities and resolves
+pauses — plus all authentication — lives in **`unistack-runtime`**, which depends on this
+package and provides the `unistack serve` command. Nothing here imports fastapi, uvicorn or
+any auth code, and that separation is deliberate: the SDK is the LangGraph connection for
+guardrails, HITL and memory, and must not grow a web server.
 
-```bash
-unistack serve my_app.graph:builder --workflow content \
-  --guard "generate=No unverified claims." --review publish --context "Brand voice: …"
-# auth comes from UNISTACK_OIDC_* env vars — see the Auth section below
-```
-
-**`UNISTACK_CONFIG` — governance as data, collocated with the graph.** Passing policy text
-(especially `context`, which can be long) as shell arguments on every deploy is awkward, and it
-puts the policy somewhere the graph's author doesn't see it. Instead, the author's module can
-declare a plain dict next to `builder`:
-
-```python
-# my_app/graph.py — still zero `unistack` import; this is just data.
-UNISTACK_CONFIG = {
-    "workflow": "content",
-    "guards": {"generate": "No unverified claims."},
-    "reviews": ["publish"],
-    "context": "Brand voice: professional, no unverified claims.",
-}
-```
-
-`unistack serve` auto-discovers a sibling `UNISTACK_CONFIG` in the same module as `builder` (by
-name — absent is fine, fully backward compatible). With it present, the deploy command collapses
-to `unistack serve my_app.graph:builder` — no flags. CLI flags still work and **merge on top**:
-`--guard`/`--review` add to (CLI wins per-key on `--guard` collisions) the config's sets;
-`--context`/`--workflow` override outright if passed. Useful for a one-off ops override without a
-redeploy, without making the common case carry the whole policy on the command line.
-
-Install with the server extra: `pip install "unistack[server]"` (fastapi + uvicorn + pyjwt).
-Everything read-only (listing pending approvals, fetching pause history) is **not** here — it
-reads the `hitl_resolutions` Mongo collection (see unistack-api). Self-host anywhere (Azure
-Container Apps, etc.) with a managed Mongo. **Scaling:** state is durable and pause resolution
-is claim-based, so multiple uvicorn workers / replicas behind a load balancer are safe.
-
-## Auth
-
-Token verification lives in the shared **`unistack-auth`** package — see
-[its CLAUDE.md](../unistack-auth/CLAUDE.md) for the `Principal` shape, claim mapping, status-code
-taxonomy and hard rules. **This repo owns only the wiring**, which is:
-
-| Endpoint | Scope required |
-|---|---|
-| `POST /activities` | `activity.start` |
-| `POST /activities/{id}/resolve` | `activity.resolve` |
-| `GET /health` | none — liveness probes carry no token |
-
-**Auth is mandatory and not omittable** — `auth` is a required keyword-only argument to
-`create_app`, and `unistack serve` exits rather than degrading when config is incomplete.
-
-```bash
-# Production — env-driven, like MONGO_URI and OTEL_*
-export UNISTACK_OIDC_JWKS_URL=https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys
-export UNISTACK_OIDC_ISSUER=https://login.microsoftonline.com/<tenant>/v2.0
-export UNISTACK_OIDC_AUDIENCE=api://unistack-runtime
-unistack serve my_app.graph:builder
-
-# Local dev — no IdP needed; identity is CONFIGURED, never taken from the caller
-unistack serve my_app.graph:builder --auth-mode token --token dev-secret
-```
-
-> **Grant the two scopes to DIFFERENT identities.** Separation is what stops an agent approving
-> its own guardrail breaches, but only if an operator actually grants them apart — one service
-> principal holding both still self-approves every run. A real `--deny-self-approval` check
-> needs `started_by` on the activity record, which arrives with BUILD_PLAN item 3.
-
-**The approver cannot be forged.** `resolved_by` is no longer accepted in the resolve body
-(sending it is a **422**); the verified `Principal` becomes the `Resolver` written to the audit
-doc as `resolved_by` (label, unchanged meaning) plus `resolved_by_subject`, `resolved_by_issuer`
-and `resolved_auth_mode` — that last field is what distinguishes a verified approver from a
-dev-mode attribution.
-
-`tests/conftest.py` generates an RSA keypair and serves its JWKS over loopback, so the auth
-tests need no identity provider.
-
-> **The gotcha that costs an hour:** Keycloak puts `account` in `aud` by default, not your
-> client. Add an **Audience** protocol mapper to the client scope or every token 401s on
-> audience and it looks like a UniStack bug.
-
-```bash
-JWKS=http://localhost:8080/realms/unistack/protocol/openid-connect/certs
-ISS=http://localhost:8080/realms/unistack
-curl -d grant_type=client_credentials -d client_id=runner -d client_secret=… \
-     -d scope=activity.start $ISS/protocol/openid-connect/token
-```
+Read-only views (listing pending approvals, pause history) are a Mongo read served by
+**`unistack-api`**. Neither service is imported by this package.
 
 ## OpenTelemetry — the span model
+
+Tracing lives in **`unistack-telemetry`** (see its CLAUDE.md), so the same OTel
+layer can back a non-LangGraph framework later. This SDK depends on
+`unistack-telemetry[langchain]` and adds only its own domain vocabulary.
 
 Pass `otel_endpoint` (+ optional `otel_headers` / `otel_service_name`), or hand in your own
 `tracer_provider`. Pure OTLP/HTTP — point it at self-hosted Langfuse
@@ -251,14 +176,10 @@ unistack/
   __init__.py      ← exports UniStack, RunResult, Resolver, UniStackError; NullHandler on the logger
   core.py          ← UniStack: init, compile, start, resume, run, guard eval, resolution
                      claims, retroactive hitl_pause emission; Resolver (audit identity)
-  _telemetry.py    ← Telemetry (instance-scoped OTel provider/spans, fail-open) +
-                     OTelCallbackHandler (LangChain events → OTel spans, GenAI semconv)
   _guardrail.py    ← evaluate_guardrail() via Claude tool-use (keyword-scan fallback; fail-closed)
-  server.py        ← create_app(sdk, graph, *, auth): the focused graph-runtime (FastAPI)
-  cli.py           ← `unistack serve module:builder …`; discovers a sibling UNISTACK_CONFIG
 pyproject.toml  requirements.txt  README.md
-tests/conftest.py (RSA keypair + loopback JWKS + make_token)  tests/test_auth.py
-tests/test_guardrail.py  tests/test_telemetry.py  tests/test_server.py  tests/test_cli.py
+tests/test_guardrail.py   ← guards, reviews, HITL, durability, resolution claims
+tests/test_telemetry.py   ← span shape (InMemorySpanExporter; no network)
 ```
 
 ## MongoDB — what this writes (and cleans up)
@@ -292,15 +213,11 @@ Notes:
 
 ## Environment variables
 
-**None read, none written.** All config is constructor params; OTel tracing is instance-scoped
-(the SDK builds — or is handed — a `TracerProvider` and injects its own callback handler into
-the graph config; `trace.set_tracer_provider` is never called, no `OTEL_*` globals). The
-`unistack serve` CLI, acting as the consuming app, reads `MONGO_URI` / `ANTHROPIC_API_KEY` /
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) /
-`OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_SERVICE_NAME`, plus the auth vars — `UNISTACK_AUTH_MODE`,
-`UNISTACK_OIDC_JWKS_URL`, `UNISTACK_OIDC_ISSUER`, `UNISTACK_OIDC_AUDIENCE`,
-`UNISTACK_API_TOKEN`, `UNISTACK_DEV_IDENTITY`, `UNISTACK_TOKEN_SCOPES` — and passes them in.
-`auth.py` itself reads no environment: it receives an `AuthConfig`.
+**None read, none written** — all configuration is constructor parameters, and OTel tracing
+is instance-scoped (the provider is constructor-supplied or SDK-built, never installed
+globally; `trace.set_tracer_provider` is never called). The consuming app does the env
+reading: see `unistack-runtime`.
+
 Note `langsmith` remains installed *transitively* (langchain-core requires it) — never set
 `LANGSMITH_TRACING=true` in a deployment env, or langchain's own global tracer re-activates.
 
@@ -315,13 +232,9 @@ terminal prompt, which is deliberately stdin/stdout.
 
 ```bash
 python3.13 -m venv venv
-venv/bin/python -m pip install -e ".[server,dev]"   # server: fastapi/uvicorn/pyjwt · dev: pytest/httpx
+venv/bin/python -m pip install -e ".[dev]"           # dev: pytest, httpx
 PYTHONPATH=. venv/bin/python -m pytest tests/ -v    # needs MongoDB on localhost:27017
 ```
-
-Auth tests need no IdP: `tests/conftest.py` generates an RSA keypair per session and serves its
-JWKS from a loopback HTTP server, so the real `PyJWKClient` fetch/cache path is exercised with
-no network and no test-only seam in shipped code.
 
 ## Hard constraints
 
@@ -348,11 +261,9 @@ no network and no test-only seam in shipped code.
    instrumentor may monkey-patch LangChain/LangGraph.
 10. `langgraph` stays a version RANGE (`>=1.2,<2.0`), never a pin — the SDK must install
     alongside whatever LangGraph the consumer's agent already uses.
-11. Auth is neither optional nor omittable: `create_app` takes `auth` as a required
-    keyword-only argument and the CLI exits on incomplete config, so there is no code path
-    that serves an open runtime. The audit identity comes from verified token claims, never
-    from a request body. Starting and resolving are separate scopes. Only `RS256` is
-    accepted and the algorithm is never read from the token.
+11. This package is a LIBRARY. No web server, no authentication, no vendor SDK — the
+    judge speaks OpenAI-compatible chat and nothing else. A service belongs in
+    `unistack-runtime`; token verification belongs in `unistack-auth`.
 
 ## Roadmap
 

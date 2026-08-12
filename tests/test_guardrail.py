@@ -7,6 +7,7 @@ call is a no-op and nothing hits the network; span behaviour is covered by
 tests/test_telemetry.py. start()/resume() are synchronous — no threads or polling.
 """
 
+import json
 import re
 from typing import TypedDict
 from unittest.mock import patch
@@ -272,28 +273,29 @@ def test_guardrail_keyword_fallback_breach():
 
 # ── Judge failure fails CLOSED (never crash, never silently pass) ───────────────
 
+def _gateway_response(verdict: dict):
+    """Shape an OpenAI-compatible chat.completions response carrying a forced tool call."""
+    from unittest.mock import MagicMock
+    resp = MagicMock()
+    resp.choices[0].message.tool_calls[0].function.arguments = json.dumps(verdict)
+    return resp
+
+
 def test_judge_api_error_fails_closed():
     from unistack._guardrail import evaluate_guardrail
-    with patch("anthropic.Anthropic") as anthro:
-        anthro.return_value.messages.create.side_effect = RuntimeError("api down")
-        result = evaluate_guardrail("policy", "output", api_key="sk-ant-fake")
+    with patch("openai.OpenAI") as openai_cls:
+        openai_cls.return_value.chat.completions.create.side_effect = RuntimeError("api down")
+        result = evaluate_guardrail("policy", "output", api_key="k", base_url="http://gw/v1")
     assert result["passed"] is False
     assert "judge unavailable" in result["reason"]
 
 
 def test_judge_malformed_verdict_fails_closed():
-    from unittest.mock import MagicMock
-
     from unistack._guardrail import evaluate_guardrail
-
-    block = MagicMock()
-    block.type = "tool_use"
-    block.input = {"pass": True}                 # wrong key — malformed verdict
-    resp = MagicMock()
-    resp.content = [block]
-    with patch("anthropic.Anthropic") as anthro:
-        anthro.return_value.messages.create.return_value = resp
-        result = evaluate_guardrail("policy", "output", api_key="sk-ant-fake")
+    with patch("openai.OpenAI") as openai_cls:
+        openai_cls.return_value.chat.completions.create.return_value = _gateway_response(
+            {"pass": True})                      # wrong key — malformed verdict
+        result = evaluate_guardrail("policy", "output", api_key="k", base_url="http://gw/v1")
     assert result["passed"] is False
     assert "malformed verdict" in result["reason"]
 
@@ -505,3 +507,91 @@ def test_init_never_mutates_environ():
                   otel_headers="Authorization=Basic fake")
     after = {k: os.environ.get(k) for k in before}
     assert before == after
+
+
+# ── Gateway path: OpenAI-compatible endpoint (BUILD_PLAN item 2) ───────────────
+
+def test_gateway_path_uses_openai_route_with_forced_tool_choice():
+    """
+    The OpenAI-compatible protocol, not a provider-native one: it is the route gateways
+    meter and budget, which is the whole point of putting one in the path.
+    """
+    from unistack._guardrail import evaluate_guardrail
+    with patch("openai.OpenAI") as openai_cls:
+        create = openai_cls.return_value.chat.completions.create
+        create.return_value = _gateway_response({"passed": True, "reason": "compliant"})
+        result = evaluate_guardrail("policy", "output", api_key="sk-gateway",
+                                    model="judge-fast",
+                                    base_url="http://localhost:4000/v1")
+
+    assert result == {"passed": True, "reason": "compliant"}
+    assert openai_cls.call_args.kwargs["base_url"] == "http://localhost:4000/v1"
+    kwargs = create.call_args.kwargs
+    assert kwargs["model"] == "judge-fast"          # a gateway alias, never a raw model id
+    assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "verdict"}}
+
+
+def test_gateway_path_sends_spend_attribution_metadata():
+    from unistack._guardrail import evaluate_guardrail
+    with patch("openai.OpenAI") as openai_cls:
+        create = openai_cls.return_value.chat.completions.create
+        create.return_value = _gateway_response({"passed": True, "reason": "ok"})
+        evaluate_guardrail("policy", "output", api_key="k", base_url="http://gw/v1",
+                           metadata={"activity_id": "content-1", "workflow": "content",
+                                     "node": "generate"})
+    assert create.call_args.kwargs["extra_body"] == {
+        "metadata": {"activity_id": "content-1", "workflow": "content", "node": "generate"}}
+
+
+class _Status(Exception):
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize("exc, expected", [
+    (_Status("ExceededBudget: Key=abc over budget. Spend=5.1, Budget=5.0", 400), "budget"),
+    (_Status("rate limit exceeded", 429), "rate limit"),
+    (RuntimeError("connection reset by peer"), "judge unavailable"),
+])
+def test_judge_failures_are_classified_for_the_approver(exc, expected):
+    """
+    A spent budget, a transient 429 and a dead judge all paused identically before — the
+    human approving had no idea which. Each now gets its own actionable reason.
+    """
+    from unistack._guardrail import evaluate_guardrail
+    with patch("openai.OpenAI") as openai_cls:
+        openai_cls.return_value.chat.completions.create.side_effect = exc
+        result = evaluate_guardrail("policy", "output", api_key="k", base_url="http://gw/v1")
+    assert result["passed"] is False                     # every path still fails CLOSED
+    assert expected in result["reason"].lower()
+
+
+def test_provider_error_text_never_reaches_the_reason():
+    """
+    The reason lands in hitl_resolutions and the HTTP response, so it must not carry raw
+    provider internals.
+    """
+    from unistack._guardrail import evaluate_guardrail
+    leak = "Traceback: /usr/lib/site-packages/openai/_client.py line 42 sk-secret-key"
+    with patch("openai.OpenAI") as openai_cls:
+        openai_cls.return_value.chat.completions.create.side_effect = RuntimeError(leak)
+        result = evaluate_guardrail("policy", "output", api_key="k", base_url="http://gw/v1")
+    assert "sk-secret-key" not in result["reason"]
+    assert "Traceback" not in result["reason"]
+
+
+def test_sdk_passes_gateway_config_and_metadata_through(clean_db):
+    """End to end through the SDK: base_url plumbed, and the activity attributed."""
+    sdk = UniStack.init(workflow="gw", mongo_uri=MONGO_URI, db_name=TEST_DB,
+                        llm_base_url="http://gw/v1", llm_api_key="sk-virtual",
+                        guardrail_model="judge-fast")
+    with patch("openai.OpenAI") as openai_cls:
+        create = openai_cls.return_value.chat.completions.create
+        create.return_value = _gateway_response({"passed": True, "reason": "fine"})
+        verdict = sdk.evaluate("policy", "some output", thread_id="gw-1", node="generate")
+
+    assert verdict["passed"] is True
+    assert openai_cls.call_args.kwargs == {"api_key": "sk-virtual", "base_url": "http://gw/v1"}
+    assert create.call_args.kwargs["extra_body"]["metadata"] == {
+        "activity_id": "gw-1", "workflow": "gw", "node": "generate"}

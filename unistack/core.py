@@ -58,7 +58,8 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
-from unistack._telemetry import Telemetry, _clip
+from unistack_telemetry import Telemetry, clip
+from unistack_telemetry.langchain import callback_handler
 
 if TYPE_CHECKING:
     from langgraph.graph import StateGraph
@@ -137,9 +138,15 @@ class UniStack:
         guardrail_model: str = "claude-haiku-4-5-20251001",
         checkpointer=None,
         tracer_provider=None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
     ):
         self._workflow = workflow
-        self._anthropic_api_key = anthropic_api_key
+        # The judge speaks OpenAI-compatible chat completions. Point llm_base_url at a
+        # gateway and its calls become metered, budget-capped and allow-listed;
+        # `guardrail_model` is then whatever name that endpoint exposes (e.g. "judge-fast").
+        self._llm_base_url = llm_base_url
+        self._anthropic_api_key = llm_api_key or anthropic_api_key
         self._guardrail_model = guardrail_model
         self._guardrail_context = context
         self._mongo_uri = mongo_uri
@@ -158,6 +165,15 @@ class UniStack:
         self._telemetry = Telemetry(workflow, tracer_provider=tracer_provider,
                                     endpoint=otel_endpoint, headers=otel_headers,
                                     service_name=otel_service_name)
+
+    def _stamp_result(self, span, result: RunResult) -> None:
+        """Stamp a leg root with the run outcome. Lives here, not in unistack-telemetry:
+        it is the only telemetry call that reads a UniStack domain object."""
+        self._telemetry.set_attrs(span, {
+            "unistack.status": result.status,
+            "unistack.pause.node": result.node,
+            "unistack.pause.message": clip(result.message, 1000) if result.message else None,
+        })
 
     @classmethod
     def init(cls, *args, **kwargs) -> "UniStack":
@@ -222,7 +238,7 @@ class UniStack:
         activity_id = f"{self._workflow}-{run_id}"
         with self._telemetry.leg("start", activity_id) as span:
             result = self._drive(graph, initial_state, activity_id)
-            self._telemetry.stamp_result(span, result)
+            self._stamp_result(span, result)
         return result
 
     def resume(self, graph, activity_id: str, decision: str,
@@ -249,7 +265,7 @@ class UniStack:
                                   **(resolver.attrs("unistack.resolved_by") if resolver
                                      else {"unistack.resolved_by": ""})}) as span:
             result = self._resume(graph, activity_id, decision, resolver)
-            self._telemetry.stamp_result(span, result)
+            self._stamp_result(span, result)
         return result
 
     def _resume(self, graph, activity_id: str, decision: str,
@@ -376,7 +392,11 @@ class UniStack:
             verdict = self.evaluate(self._guards[node], json.dumps(output, default=str),
                                     thread_id=activity_id, node=node)
         except Exception as exc:
-            verdict = {"passed": False, "reason": f"guardrail judge error: {exc}"}
+            # Coarse reason only — this string reaches hitl_resolutions and the HTTP
+            # response; the detail belongs in the log.
+            logger.warning("guardrail judge raised for node '%s' (%s: %s)",
+                           node, type(exc).__name__, exc)
+            verdict = {"passed": False, "reason": "guardrail judge error"}
         if not isinstance(verdict, dict) or not isinstance(verdict.get("passed"), bool):
             verdict = {"passed": False, "reason": f"malformed guardrail verdict: {verdict!r}"}
         return verdict
@@ -414,7 +434,7 @@ class UniStack:
             "metadata":     self._thread_meta(activity_id),
             "tags":         [activity_id, self._workflow],
         }
-        handler = self._telemetry.handler(activity_id)
+        handler = callback_handler(self._telemetry, activity_id)
         if handler is not None:
             # Instance-scoped tracing: an explicit OTel callback handler in the graph
             # config — nothing global, no os.environ writes. Node-internal llm.invoke()
@@ -509,22 +529,29 @@ class UniStack:
     def evaluate(self, policy: str, output: str, thread_id: str | None = None,
                  node: str | None = None) -> dict:
         """
-        Evaluate output against a policy using Claude (LLM-as-judge).
+        Evaluate output against a policy using an LLM judge.
         Returns {"passed": bool, "reason": str}. Falls back to a keyword scan when no
-        anthropic_api_key was supplied; fails closed (passed=False) if the judge errors.
+        api key was supplied; fails closed (passed=False) if the judge errors.
         Traced as a `guardrail_eval` span — nested in the running leg's trace when
         called mid-run (thread_id = the activity id), a standalone trace otherwise.
         """
         from unistack._guardrail import evaluate_guardrail
         with self._telemetry.span("guardrail_eval", {
                 "unistack.guardrail.node": node,
-                "unistack.guardrail.policy": _clip(policy, 1000),
+                "unistack.guardrail.policy": clip(policy, 1000),
                 "unistack.guardrail.mode": "llm" if self._anthropic_api_key else "keyword",
         }, activity_id=thread_id) as span:
+            # Sent to the gateway so spend is attributable per activity, not just per key —
+            # the cost input the projector needs (BUILD_PLAN item 7).
+            metadata = {k: v for k, v in {"activity_id": thread_id,
+                                          "workflow": self._workflow,
+                                          "node": node}.items() if v}
             verdict = evaluate_guardrail(policy, output, self._guardrail_context,
                                          api_key=self._anthropic_api_key,
                                          model=self._guardrail_model,
-                                         telemetry=self._telemetry)
+                                         telemetry=self._telemetry,
+                                         base_url=self._llm_base_url,
+                                         metadata=metadata)
             self._telemetry.set_attrs(span, {
                 "unistack.guardrail.passed": verdict.get("passed"),
                 "unistack.guardrail.reason": verdict.get("reason")})
@@ -554,7 +581,7 @@ class UniStack:
             "unistack.activity_id": activity_id,
             "unistack.workflow": doc.get("workflow") or self._workflow,
             "unistack.pause.node": doc.get("node"),
-            "unistack.pause.message": _clip(doc["message"], 1000) if doc.get("message") else None,
+            "unistack.pause.message": clip(doc["message"], 1000) if doc.get("message") else None,
             "unistack.decision": decision,
             **(resolver.attrs("unistack.resolved_by") if resolver
                else {"unistack.resolved_by": ""}),
