@@ -145,8 +145,11 @@ def evaluate_guardrail(
             f"Policy to enforce: {policy}\n\n"
             f"<output_to_evaluate>\n{output}\n</output_to_evaluate>"
         )
-        llm_cm = telemetry.llm_span(model, input_value=prompt) if telemetry is not None \
-            else nullcontext()
+        # activity_id groups this generation into its activity's session; without it every
+        # judge call was orphaned from the run it judged.
+        llm_cm = telemetry.llm_span(model, input_value=prompt,
+                                    activity_id=(metadata or {}).get("activity_id")) \
+            if telemetry is not None else nullcontext()
         with llm_cm as llm_span:
             verdict, usage_attrs = _ask_judge(api_key, base_url, model, prompt, metadata)
             if telemetry is not None:

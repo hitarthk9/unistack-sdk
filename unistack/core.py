@@ -247,7 +247,8 @@ class UniStack:
         activity_id = f"{self._workflow}-{run_id}"
         starter = Resolver.coerce(started_by)
         with self._telemetry.leg("start", activity_id,
-                                 starter.attrs("unistack.started_by") if starter else None) as span:
+                                 starter.attrs("unistack.started_by") if starter else None,
+                                 user_id=starter.label if starter else None) as span:
             trace_ids = self._telemetry.current_ids()
             self.activity_records().started(
                 activity_id, self._workflow,
@@ -284,7 +285,8 @@ class UniStack:
         with self._telemetry.leg("resume", activity_id,
                                  {"unistack.decision": decision,
                                   **(resolver.attrs("unistack.resolved_by") if resolver
-                                     else {"unistack.resolved_by": ""})}) as span:
+                                     else {"unistack.resolved_by": ""})},
+                                 user_id=resolver.label if resolver else None) as span:
             result = self._resume(graph, activity_id, decision, resolver)
             self._stamp_result(span, result)
         self._finalize_activity(result)

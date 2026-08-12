@@ -296,9 +296,12 @@ The SDK items, in order. Do not start one before its predecessors.
    that never pauses leaves *no* durable record — checkpoints are deleted at terminal and
    `hitl_resolutions` only exists when something paused, so the only evidence is a fail-open
    trace. Same weight and role as `hitl_resolutions`: an index and audit record, not a queue.
-4. **Trace enrichment.** Capture retrieval/context inputs as node-span attributes and tag
-   traces with `workflow`. Langfuse evaluators can only judge what the spans contain — a
-   groundedness judge that cannot see the retrieved context produces confident noise.
+4. ~~**Trace enrichment.**~~ **DONE (Aug 2026)** — built in `unistack-telemetry`; this SDK only
+   passes `activity_id` into `llm_span()` (so judge generations join their activity's session)
+   and `started_by` into `leg()` (so the trace carries a user). Retriever hooks, the workflow
+   trace tag and the raised payload budget all live in the telemetry package. The premise shifted
+   on audit: prompts and outputs were already captured — the real gaps were dropped retriever
+   events, discarded tags/user, an orphaned judge generation, and a silent zero cost.
 5. **Security layer** (distinct from guards — see below). Layer 1 always on and deterministic:
    tool allow-list, argument inspection (secrets, PII, destructive verbs), untrusted-source
    flagging. Layer 2 LLM security judge behind a trigger only (ambiguous flag, high-risk tool,
