@@ -302,11 +302,15 @@ The SDK items, in order. Do not start one before its predecessors.
    trace tag and the raised payload budget all live in the telemetry package. The premise shifted
    on audit: prompts and outputs were already captured — the real gaps were dropped retriever
    events, discarded tags/user, an orphaned judge generation, and a silent zero cost.
-5. **Security layer** (distinct from guards — see below). Layer 1 always on and deterministic:
-   tool allow-list, argument inspection (secrets, PII, destructive verbs), untrusted-source
-   flagging. Layer 2 LLM security judge behind a trigger only (ambiguous flag, high-risk tool,
-   retrieved content) — never on by default. Findings to `unistack.security_events` in Mongo
-   (authoritative, telemetry-independent) plus a span event for trace correlation.
+5. **Security layer — deterministic only, no LLM at all** (distinct from guards — see below).
+   This SDK owns the **tool gate**: tool allow-list, argument inspection (secrets, PII,
+   destructive verbs), untrusted-source flagging, before a tool runs. A gateway sees model
+   calls and cannot see a tool invocation, which is why this half cannot live in LiteLLM.
+   PII masking, secret-stripping and the prompt-injection heuristic run in the **gateway**
+   instead. Findings to `unistack.security_events` in Mongo (authoritative,
+   telemetry-independent) plus a span event for trace correlation.
+   **There is no LLM security judge in the request path** — it was moved to item 6 and runs
+   forensically on completed traces, so a rare event costs nothing on the common path.
 
 **The security check is not the business-policy guard.** A guard runs *after* a node, judges
 its *output* against policy, and *pauses for a human*. A security check runs *before* a call
