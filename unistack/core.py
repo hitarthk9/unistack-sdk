@@ -58,6 +58,7 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
+from unistack import _knowledge
 from unistack_telemetry import TERMINAL_STATUSES, ActivityRecords, Telemetry, clip
 from unistack_telemetry.langchain import callback_handler
 
@@ -140,6 +141,7 @@ class UniStack:
         tracer_provider=None,
         llm_base_url: str | None = None,
         llm_api_key: str | None = None,
+        knowledge_bases: dict | None = None,
     ):
         self._workflow = workflow
         # The judge speaks OpenAI-compatible chat completions. Point llm_base_url at a
@@ -149,6 +151,11 @@ class UniStack:
         self._anthropic_api_key = llm_api_key or anthropic_api_key
         self._guardrail_model = guardrail_model
         self._guardrail_context = context
+        # Validated at construction: a malformed knowledge base should stop the process
+        # starting, not surface as a degraded guard on the first activity. The SDK never reads
+        # the file — `unistack serve` loads the YAML and passes the parsed data in.
+        self._knowledge_bases = {name: _knowledge.validate(kb)
+                                 for name, kb in (knowledge_bases or {}).items()}
         self._mongo_uri = mongo_uri
         self._mongo: MongoClient | None = None      # lazy — connected on first use
         self._db_name = db_name
@@ -206,14 +213,24 @@ class UniStack:
 
     # ── Latch-on ──────────────────────────────────────────────────────────────
 
-    def compile(self, builder: "StateGraph", guards: dict[str, str] | None = None,
+    def compile(self, builder: "StateGraph", guards: dict | None = None,
                 reviews: list[str] | None = None) -> "CompiledStateGraph":
         """
         Compile an EXISTING StateGraph builder with guardrail + HITL breakpoints and a
         durable checkpointer. The author's nodes are untouched — UniStack only adds
         static breakpoints (`interrupt_after`) and drives the pauses.
+
+        A guard value is either a policy string, or a mapping naming a knowledge base:
+        `{"policy": "...", "knowledge_base": "brand-policy"}`. Mappings are resolved HERE, at
+        compile time, so a guard that names a knowledge base which was never supplied fails
+        immediately rather than mid-run with a silently empty policy.
         """
         self._guards = dict(guards or {})
+        for node, guard in self._guards.items():
+            policy, kb_name = _knowledge.resolve(guard, self._knowledge_bases)
+            if kb_name:
+                rendered = _knowledge.policy_block(policy, self._knowledge_bases[kb_name])
+                _knowledge.check_size(kb_name, rendered)
         self._reviews = set(reviews or [])
         stops = list(self._guards) + [n for n in self._reviews if n not in self._guards]
         # Keep a handle on the checkpointer so a terminal activity can have its Mongo
@@ -384,7 +401,11 @@ class UniStack:
                 if verdict["passed"]:
                     logger.info("guard[%s] passed — continuing", node)
                 else:
-                    breaches.append((node, verdict["reason"]))
+                    # Prefix the cited rule ids so the approver sees WHICH rule fired, not
+                    # just that something did — the point of knowledge-base guards.
+                    cited = ", ".join(verdict.get("rule_ids") or [])
+                    breaches.append((node, f"[{cited}] {verdict['reason']}" if cited
+                                     else verdict["reason"]))
             review_hits = [n for n, _ in updates
                            if n in self._reviews and n not in self._guards]
 
@@ -413,16 +434,23 @@ class UniStack:
     def _judge(self, node: str, output, activity_id: str) -> dict:
         """Judge one node's output. Never raises — a failing judge fails closed (breach)."""
         try:
-            verdict = self.evaluate(self._guards[node], json.dumps(output, default=str),
+            # Resolve the guard to its full trusted policy text. Every rule of a knowledge base
+            # is included on every call: there is no retrieval, so the judge can never miss a
+            # rule it should have applied (see unistack/_knowledge.py).
+            policy, kb_name = _knowledge.resolve(self._guards[node], self._knowledge_bases)
+            policy_text = _knowledge.policy_block(
+                policy, self._knowledge_bases.get(kb_name) if kb_name else None)
+            verdict = self.evaluate(policy_text, json.dumps(output, default=str),
                                     thread_id=activity_id, node=node)
         except Exception as exc:
             # Coarse reason only — this string reaches hitl_resolutions and the HTTP
             # response; the detail belongs in the log.
             logger.warning("guardrail judge raised for node '%s' (%s: %s)",
                            node, type(exc).__name__, exc)
-            verdict = {"passed": False, "reason": "guardrail judge error"}
+            verdict = {"passed": False, "reason": "guardrail judge error", "rule_ids": []}
         if not isinstance(verdict, dict) or not isinstance(verdict.get("passed"), bool):
-            verdict = {"passed": False, "reason": f"malformed guardrail verdict: {verdict!r}"}
+            verdict = {"passed": False, "rule_ids": [],
+                       "reason": f"malformed guardrail verdict: {verdict!r}"}
         return verdict
 
     def _completed(self, graph, config, activity_id: str) -> RunResult:

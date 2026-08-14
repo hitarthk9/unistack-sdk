@@ -257,7 +257,7 @@ def test_judge_llm_span_carries_genai_usage(exporter, sdk_factory):
     with patch("openai.OpenAI") as openai_cls:
         openai_cls.return_value.chat.completions.create.return_value = resp
         verdict = sdk.evaluate("no fraud", "clean output", node="gen")
-    assert verdict == {"passed": True, "reason": "fine"}
+    assert verdict == {"passed": True, "reason": "fine", "rule_ids": []}
 
     guard = _one(exporter, "guardrail_eval")
     llm = _one(exporter, "chat claude-haiku-4-5-20251001")
@@ -265,7 +265,8 @@ def test_judge_llm_span_carries_genai_usage(exporter, sdk_factory):
     assert llm.attributes["gen_ai.request.model"] == "claude-haiku-4-5-20251001"
     assert llm.attributes["gen_ai.usage.input_tokens"] == 123
     assert llm.attributes["gen_ai.usage.output_tokens"] == 45
-    assert json.loads(llm.attributes["output.value"]) == {"passed": True, "reason": "fine"}
+    assert json.loads(llm.attributes["output.value"]) == {
+        "passed": True, "reason": "fine", "rule_ids": []}
     assert guard.attributes["unistack.guardrail.mode"] == "llm"
     assert guard.attributes["unistack.guardrail.passed"] is True
 

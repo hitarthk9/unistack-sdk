@@ -524,7 +524,8 @@ def test_gateway_path_uses_openai_route_with_forced_tool_choice():
                                     model="judge-fast",
                                     base_url="http://localhost:4000/v1")
 
-    assert result == {"passed": True, "reason": "compliant"}
+    # rule_ids is always present now — empty when the policy carries no [RULE-ID]s to cite.
+    assert result == {"passed": True, "reason": "compliant", "rule_ids": []}
     assert openai_cls.call_args.kwargs["base_url"] == "http://localhost:4000/v1"
     kwargs = create.call_args.kwargs
     assert kwargs["model"] == "judge-fast"          # a gateway alias, never a raw model id

@@ -48,6 +48,8 @@ is passed explicitly** — the SDK reads no environment variables, writes none, 
   **Fail-closed:** if the judge itself fails (API error, malformed verdict), the output is
   treated as a breach → HITL pause with "judge unavailable". A degraded judge never silently
   passes output, and never crashes the activity.
+- **Knowledge base** — a guard's policy as governed, versioned data instead of a sentence. See
+  the section below.
 - **Review** — `reviews=[node]`. Unconditional human sign-off after the node. Always pauses.
 
 Both are LangGraph **static breakpoints** (`interrupt_after`). The author's graph topology is
@@ -64,7 +66,7 @@ graph = sdk.compile(builder, guards={"n": "policy"}, reviews=["m"])
 r = sdk.start(graph, initial_state, run_id=None, started_by=None)   # non-blocking; ts+hex id
 r = sdk.resume(graph, activity_id, decision, resolved_by=None)   # "approved" | "rejected"
 r = sdk.run(graph, initial_state, decide=None)             # local convenience over start/resume
-sdk.evaluate("policy", output_str)                         # {"passed", "reason"} — raw guard check
+sdk.evaluate("policy", output_str)                         # {"passed","reason","rule_ids"} — raw check
 sdk.close()                                                # also flushes buffered OTel spans
                                                            # or use `with UniStack.init(...) as sdk:`
 
@@ -95,8 +97,58 @@ so nothing that passed a string before needs to change.
 | `context` | No | Business-domain text for the guardrail judge |
 | `db_name` | No | Mongo database (default `unistack`) |
 | `guardrail_model` | No | Judge model (default `claude-haiku-4-5-20251001`) |
+| `knowledge_bases` | No | `{name: parsed-KB-dict}` a guard may name. Validated here — malformed data fails at `init()`, never mid-run. The SDK loads no files; `unistack serve` parses the YAML |
 | `checkpointer` | No | Override the default `MongoDBSaver` (e.g. a Postgres saver) |
 | `tracer_provider` | No | Caller-owned OTel `TracerProvider` — overrides `otel_endpoint`; the test seam. Never installed globally |
+
+## Knowledge-base-backed guards
+
+A guard value is either a **policy string** (unchanged, still fully supported) or a **mapping**
+naming a knowledge base:
+
+```python
+sdk = UniStack.init(..., knowledge_bases={"brand-policy": {...parsed YAML...}})
+graph = sdk.compile(builder, guards={
+    "generate": {"knowledge_base": "brand-policy"},          # rules only
+    "publish":  {"policy": "Must include a CTA.",            # node prose + the shared rules
+                 "knowledge_base": "brand-policy"},
+})
+```
+
+A knowledge base is plain data — `{knowledge_base, version, rules: [{id, rule, examples}]}` —
+validated at `init()` and rendered into the judge's prompt by `unistack/_knowledge.py`. **The
+SDK does not load it**: `unistack serve` reads `knowledge/*.yaml` from beside the agent module
+and passes the parsed dicts in (hard constraint #9).
+
+**Stable `id`s are the point.** The judge returns `rule_ids`, and they are prefixed onto the
+breach message, so the human approving the pause is told *which* rule fired:
+
+> `Guardrail breach after 'generate': [BP-001] The output claims a wellbeing outcome without…`
+
+That message is what lands in `hitl_resolutions` and the HTTP response. **Never renumber a rule**
+— retire the id and add a new one, or historical audit records point at the wrong rule.
+
+### Every rule is sent on every evaluation — there is deliberately no retrieval
+
+This was reversed from the original RAG design after stress-testing it, for three reasons:
+
+1. **Retrieval would add a fail-open to a safety control.** A miss means the judge never sees the
+   relevant rule and passes output it should have caught, silently. Sending everything keeps the
+   guarantee the string guard already had.
+2. **It is cheaper.** A byte-identical policy block is prompt-cacheable; retrieval sends different
+   passages each call and forfeits the cache. Measured through the gateway: 6,564 of 7,008 input
+   tokens read from cache on the second call, billed at ~0.1×. `cache_control` is applied only
+   above Anthropic's 4,096-token minimum — below it there is nothing to gain.
+3. **It is auditable and deterministic** — no embedding model, no threshold, no vector store.
+
+⚠️ Two invariants that keep the caching real: `_knowledge.render()` must stay **deterministic**
+(no timestamps, no re-ordering — a changed byte costs ~10×), and the trusted policy goes in the
+**system** message while the judged output goes in the **user** message. That split is also the
+injection boundary — untrusted output must not sit alongside the policy it could try to override.
+
+**Where this stops scaling: attention, not context.** A judge weighing hundreds of rules applies
+each less carefully. `_knowledge.MAX_RULE_TOKENS` (~50k) warns and says so. Retrieval becomes the
+right answer in the high hundreds of rules — not before.
 
 ## How start / resume work (durable, request-driven)
 
@@ -176,10 +228,14 @@ unistack/
   __init__.py      ← exports UniStack, RunResult, Resolver, UniStackError; NullHandler on the logger
   core.py          ← UniStack: init, compile, start, resume, run, guard eval, resolution
                      claims, retroactive hitl_pause emission; Resolver (audit identity)
-  _guardrail.py    ← evaluate_guardrail() via Claude tool-use (keyword-scan fallback; fail-closed)
+  _guardrail.py    ← evaluate_guardrail() via forced tool-use (keyword-scan fallback; fail-closed);
+                     trusted policy in the system message, judged output in the user message
+  _knowledge.py    ← knowledge bases: validate / render / resolve a guard / size warning.
+                     Pure — no IO, no network, no Mongo
 pyproject.toml  requirements.txt  README.md
 tests/test_guardrail.py   ← guards, reviews, HITL, durability, resolution claims
 tests/test_telemetry.py   ← span shape (InMemorySpanExporter; no network)
+tests/test_knowledge.py   ← knowledge bases: validation, rendering, citations in the pause message
 ```
 
 ## MongoDB — what this writes (and cleans up)
@@ -320,12 +376,6 @@ list can do: allow-lists and pattern checks are cheaper, faster, non-flaky, and 
 
 ### Planned (must-have, not yet built)
 
-- **Knowledge-base-backed guards.** Today a guard is a plain policy *string* judged by the LLM.
-  Add a first-class **knowledge base** resource so a guard can ground its judgment against
-  retrieved documents (e.g. a client compliance manual), not just inline text — e.g.
-  `guards={"generate": {"policy": "...", "knowledge_base": "compliance_docs"}}`, with a retrieval
-  step feeding the judge's context before the compliance check. Bounded addition (a retrieval call
-  + a KB registry), not a rewrite. **Highest-value next feature.**
 - **Multiple deployment surfaces.** `unistack serve` exposes one REST API today. The graph engine
   is transport-agnostic — `start()`/`resume()`/status over an `activity_id` — so additional
   surfaces are **thin adapters over that same core, never forks of the engine**:
