@@ -182,7 +182,7 @@ def evaluate_guardrail(
     output through.
     """
     if not api_key:
-        # Keyword-based fallback so demo works without an API key
+        # Keyword-based fallback so an agent runs without an API key
         breach_keywords = ["fraud", "discriminat", "illegal", "banned", "blocked", "sanctioned"]
         lowered = output.lower()
         for kw in breach_keywords:

@@ -100,9 +100,9 @@ def render(kb: dict) -> str:
         #
         # EVERY label is rendered, in the order the author wrote them — not a fixed
         # violating/compliant pair. A rule often needs a second example to mark a boundary the
-        # judge over-reaches on (see BP-001 in the demo), and a renderer that quietly dropped
-        # the extra label would leave the author editing a file that has no effect. Order is
-        # the YAML's own, so the block stays byte-stable and therefore cacheable.
+        # judge over-reaches on (see BP-001 in the reference agent), and a renderer that quietly
+        # dropped the extra label would leave the author editing a file that has no effect.
+        # Order is the YAML's own, so the block stays byte-stable and therefore cacheable.
         if isinstance(examples, dict):
             for label, text in examples.items():
                 if text and not isinstance(text, (dict, list)):
