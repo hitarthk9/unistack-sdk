@@ -241,7 +241,8 @@ class UniStack:
     # ── Durable, non-blocking run cycle ─────────────────────────────────────────
 
     def start(self, graph, initial_state: dict, run_id: str | None = None,
-              started_by: "str | Resolver | None" = None) -> RunResult:
+              started_by: "str | Resolver | None" = None,
+              entity_key: str | None = None) -> RunResult:
         """
         Begin an activity. Runs until the first human pause (guard breach / review) or
         END, then RETURNS — never blocks. On a pause, records a pending resolution in
@@ -257,6 +258,13 @@ class UniStack:
 
         A durable record is written in `unistack.activities` at start and closed at terminal,
         so an activity that never pauses still leaves proof it ran.
+
+        `entity_key` names WHAT this activity was about (a site + alarm class, a ticket, a
+        customer) and is what makes cross-activity metrics — "was this fixed without recurring"
+        — expressible. The SDK does not compute it: like `knowledge_bases`, it is resolved from
+        the agent's own declaration by `unistack serve` and passed in as data, because deriving
+        it would mean this library reading config. It cannot be added after the fact, since
+        terminal checkpoints are deleted.
         """
         run_id = run_id or (
             f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{secrets.token_hex(2)}"
@@ -269,7 +277,8 @@ class UniStack:
             trace_ids = self._telemetry.current_ids()
             self.activity_records().started(
                 activity_id, self._workflow,
-                trace_id=trace_ids[0] if trace_ids else None, started_by=starter)
+                trace_id=trace_ids[0] if trace_ids else None, started_by=starter,
+                entity_key=entity_key)
             try:
                 result = self._drive(graph, initial_state, activity_id)
             except Exception:
